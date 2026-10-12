@@ -1,8 +1,178 @@
 # Arboria — Sistem Penggajian dan Pengupahan Perkebunan
 
-Aplikasi pengelolaan kompensasi staf bergaji bulanan dan pemanen dengan upah berdasarkan bobot panen. Folder sengaja dijaga sederhana dan tidak memerlukan `package.json` atau dependensi npm.
+Arboria adalah aplikasi untuk mengelola data tenaga kerja perkebunan, absensi bulanan, gaji staf tetap, dan upah pemanen berdasarkan bobot hasil panen. Antarmuka dibuat dengan HTML, CSS, dan JavaScript; data terpusat disimpan di Supabase/PostgreSQL.
 
-## Struktur
+## Fitur Sistem
+
+### Dashboard
+
+- Menampilkan jumlah seluruh karyawan, staf, dan pemanen.
+- Merangkum total gaji staf, upah panen, serta bobot panen pada periode terpilih.
+- Menampilkan grafik arus kompensasi yang membandingkan gaji dan upah panen.
+- Menyediakan aksi cepat untuk mencatat gaji staf atau hasil panen.
+- Menampilkan transaksi terbaru dan akses ke daftar transaksi lengkap.
+
+### Data Karyawan
+
+- Menambah, melihat, mencari, mengubah, dan menghapus data karyawan.
+- Memfilter daftar berdasarkan semua karyawan, staf, atau pemanen.
+- Menyimpan kode karyawan, nama, jenis tenaga kerja, divisi/blok, serta gaji bulanan untuk staf.
+- Penghapusan karyawan ditolak selama masih memiliki transaksi gaji, catatan panen, atau absensi agar riwayat tetap terjaga.
+
+### Absensi
+
+- Mencatat dan mengubah hari kerja, izin, serta alfa per karyawan dan periode bulanan.
+- Mencegah lebih dari satu catatan absensi untuk karyawan yang sama pada periode yang sama.
+- Memvalidasi agar total hari kerja, izin, dan alfa tidak melebihi jumlah hari kalender pada bulan tersebut.
+- Menyediakan ringkasan dan filter periode.
+
+### Penggajian dan Pengupahan
+
+- Mencatat gaji staf berdasarkan gaji pokok, tunjangan, dan potongan.
+- Mencatat upah pemanen berdasarkan bobot panen dan tarif per kilogram.
+- Menampilkan ringkasan total gaji, upah, dan kompensasi.
+- Memfilter transaksi menurut jenis dan status pembayaran.
+- Mengubah transaksi, memperbarui tanggal pembayaran, menandai transaksi sebagai dibayar, dan menghapus transaksi.
+- Menyelaraskan tanggal panen dengan periode yang dipilih.
+- Membuka pratinjau slip pembayaran sebelum mengunduh PDF. Slip memuat data karyawan, jenis tenaga kerja, rincian pembayaran, tanggal pembayaran, tanda tangan, dan identitas Arboria.
+
+### Notifikasi
+
+Tombol notifikasi menampilkan informasi bahwa tidak ada notifikasi hari ini.
+
+## Entitas Basis Data
+
+Skema inti terdiri atas empat tabel.
+
+### 1. `employees` — data induk karyawan
+
+| Kolom | Keterangan |
+| --- | --- |
+| `id` | Primary key UUID yang dibuat otomatis. |
+| `employee_code` | Kode karyawan, wajib dan unik. |
+| `full_name` | Nama lengkap karyawan. |
+| `employment_type` | Jenis tenaga kerja: `staff` atau `harvester`. |
+| `division` | Divisi staf atau blok kerja pemanen. |
+| `monthly_salary` | Gaji dasar bulanan; default 0 dan tidak boleh negatif. |
+| `created_at` | Waktu pembuatan data. |
+
+### 2. `attendance_records` — catatan absensi bulanan
+
+| Kolom | Keterangan |
+| --- | --- |
+| `id` | Primary key UUID. |
+| `employee_id` | Foreign key ke `employees.id`. |
+| `period_id` | Periode dengan format `YYYY-MM`. |
+| `working_days` | Jumlah hari kerja. |
+| `leave_days` | Jumlah hari izin. |
+| `absent_days` | Jumlah hari alfa. |
+| `created_at`, `updated_at` | Timestamp dengan default `now()` saat record dibuat. `updated_at` belum diperbarui otomatis ketika record diedit. |
+
+Kombinasi `employee_id` dan `period_id` harus unik. Nilai hari harus nonnegatif dan jumlahnya tidak boleh melebihi jumlah hari kalender dalam periode tersebut.
+
+### 3. `salary_payments` — transaksi gaji staf
+
+| Kolom | Keterangan |
+| --- | --- |
+| `id` | Primary key UUID. |
+| `employee_id` | Foreign key ke `employees.id`. |
+| `period_id` | Periode gaji dengan format `YYYY-MM`. |
+| `payment_date` | Tanggal gaji yang ditetapkan. |
+| `basic_salary` | Gaji pokok. |
+| `allowances` | Tunjangan; default 0. |
+| `deductions` | Potongan; default 0. |
+| `total_amount` | Nilai hasil perhitungan otomatis database. |
+| `status` | Status `paid` atau `pending`. |
+| `paid_at` | Tanggal/waktu pembayaran aktual; dapat kosong jika belum dibayar. |
+| `created_at` | Waktu pembuatan transaksi. |
+
+Rumus total gaji: `basic_salary + allowances - deductions`. Gaji pokok, tunjangan, dan potongan tidak boleh negatif; total gaji tidak boleh kurang dari nol.
+
+### 4. `harvest_records` — transaksi hasil panen dan upah
+
+| Kolom | Keterangan |
+| --- | --- |
+| `id` | Primary key UUID. |
+| `employee_id` | Foreign key ke `employees.id`. |
+| `period_id` | Periode panen dengan format `YYYY-MM`. |
+| `harvest_date` | Tanggal panen. |
+| `weight_kg` | Bobot panen dalam kilogram; harus lebih dari nol. |
+| `rate_per_kg` | Tarif per kilogram; tidak boleh negatif. |
+| `total_amount` | Nilai hasil perhitungan otomatis database. |
+| `status` | Status `paid` atau `pending`. |
+| `paid_at` | Tanggal/waktu pembayaran aktual; dapat kosong jika belum dibayar. |
+| `created_at` | Waktu pembuatan transaksi. |
+
+Rumus total upah: `weight_kg × rate_per_kg`.
+
+## ERD dan Relasi
+
+```mermaid
+erDiagram
+    EMPLOYEES ||--o{ ATTENDANCE_RECORDS : memiliki
+    EMPLOYEES ||--o{ SALARY_PAYMENTS : menerima
+    EMPLOYEES ||--o{ HARVEST_RECORDS : menghasilkan
+
+    EMPLOYEES {
+        uuid id PK
+        text employee_code UK
+        text full_name
+        text employment_type
+        text division
+        numeric monthly_salary
+        timestamptz created_at
+    }
+    ATTENDANCE_RECORDS {
+        uuid id PK
+        uuid employee_id FK
+        text period_id
+        smallint working_days
+        smallint leave_days
+        smallint absent_days
+    }
+    SALARY_PAYMENTS {
+        uuid id PK
+        uuid employee_id FK
+        text period_id
+        date payment_date
+        numeric basic_salary
+        numeric allowances
+        numeric deductions
+        numeric total_amount
+        text status
+        timestamptz paid_at
+    }
+    HARVEST_RECORDS {
+        uuid id PK
+        uuid employee_id FK
+        text period_id
+        date harvest_date
+        numeric weight_kg
+        numeric rate_per_kg
+        numeric total_amount
+        text status
+        timestamptz paid_at
+    }
+```
+
+### Penjelasan Relasi
+
+- **`employees` ke `attendance_records`: satu ke banyak (1:N).** Seorang karyawan dapat memiliki catatan absensi pada banyak periode. Maksimal satu catatan diperbolehkan untuk satu karyawan dalam satu periode.
+- **`employees` ke `salary_payments`: satu ke banyak (1:N).** Seorang karyawan dapat memiliki transaksi gaji pada banyak periode. Skema tidak menetapkan batas unik karyawan-periode untuk transaksi gaji.
+- **`employees` ke `harvest_records`: satu ke banyak (1:N).** Seorang pemanen dapat memiliki banyak catatan panen, termasuk beberapa catatan dalam periode yang sama.
+- Semua foreign key karyawan bersifat wajib (`NOT NULL`) dan menggunakan `ON DELETE RESTRICT`. Karyawan tidak dapat dihapus jika masih dirujuk absensi atau transaksi.
+- Tidak ada foreign key antara absensi dan tabel pembayaran, maupun ke tabel master periode. Periode disimpan langsung sebagai teks `YYYY-MM` pada setiap tabel terkait.
+
+## Aturan dan Alur Kompensasi
+
+1. Data karyawan dibuat terlebih dahulu; jenis tenaga kerja menentukan skema transaksi yang tersedia.
+2. Absensi dicatat per karyawan dan bulan; constraint database serta validasi aplikasi menjaga keunikan dan jumlah hari.
+3. Untuk staf, pengguna memilih periode dan mencatat gaji pokok, tunjangan, potongan, tanggal gaji, serta status. Database menghitung gaji bersih.
+4. Untuk pemanen, pengguna memilih periode dan mencatat tanggal panen, bobot, tarif, serta status. Tanggal panen harus berada pada bulan yang sama dengan periode; database menghitung upah.
+5. `payment_date` adalah tanggal gaji; `harvest_date` adalah tanggal panen; `paid_at` mencatat waktu pelunasan aktual.
+6. Transaksi berstatus dibayar dapat dipratinjau dan diunduh sebagai slip PDF.
+
+## Struktur Proyek
 
 ```text
 frontend/
@@ -15,51 +185,16 @@ backend/
 README.md
 ```
 
-## Menjalankan Lokal
-
-Memerlukan Node.js 18 atau lebih baru. Dari root folder proyek, jalankan:
-
-```powershell
-node backend/app.js
-```
-
-Buka `http://localhost:3000` untuk menggunakan backend Node lokal; backend tersebut terhubung ke project Supabase yang dikonfigurasi. Jangan bagikan URL `localhost` ke perangkat lain karena hanya bisa diakses dari komputer yang menjalankannya. Pada GitHub Pages, frontend mengakses Supabase langsung dan tidak membutuhkan backend lokal.
+`frontend` berisi antarmuka dan akses Supabase langsung untuk hosting statis. `backend/app.js` menyediakan API Node.js sebagai perantara untuk penggunaan melalui backend. Kedua jalur harus menunjuk ke project Supabase yang sama agar data tetap terpusat.
 
 ## Menghubungkan Supabase
 
-1. Buat proyek Supabase dan jalankan versi terbaru `backend/schema.sql` pada SQL Editor. Skema membentuk empat tabel: `employees`, `attendance_records`, `salary_payments`, dan `harvest_records`. Absensi dicatat satu baris per karyawan per bulan; kolom hari kerja, izin, dan alfa tidak boleh melebihi jumlah hari dalam bulan itu.
-2. Pastikan `SUPABASE_URL` dan `SUPABASE_PUBLISHABLE_KEY` pada konstanta di awal `frontend/script.js` dan konfigurasi backend lokal menunjuk ke project Supabase yang sama.
-3. Jika Supabase gagal dimuat pada GitHub Pages atau host publik lain, aplikasi memberi peringatan dan tidak menyimpan perubahan lokal yang akan berbeda antarperangkat. Mode demo lokal hanya digunakan saat membuka file atau menjalankan localhost.
-4. Jika pencatatan gaji menampilkan error kolom `payment_date`, jalankan ulang versi terbaru `backend/schema.sql` di SQL Editor. Skrip tersebut menambahkan kolom dan mengisi tanggal gaji lama berdasarkan akhir bulan periodenya.
+1. Buat project Supabase dan jalankan skema terbaru `backend/schema.sql` di SQL Editor. Skrip membuat atau menyesuaikan empat tabel inti dan constraint-nya.
+2. Pastikan `SUPABASE_URL` dan publishable key yang digunakan frontend serta backend menunjuk ke project yang sama. Jangan pernah menaruh `service_role` key di frontend.
+3. Browser harus terhubung ke internet agar dapat membaca dan menyimpan perubahan ke Supabase. Jika koneksi cloud gagal pada host publik, aplikasi menampilkan peringatan dan tidak beralih diam-diam ke data lokal per perangkat.
 
-**Peringatan:** skema ini membuka CRUD empat tabel ke role `anon` agar demo dapat memakai publishable key tanpa login. Siapa pun yang mengetahui URL dan key dapat membaca serta mengubah seluruh data. Gunakan hanya data latihan; jangan masukkan data karyawan atau nominal penggajian nyata.
+## Keamanan
 
-PowerShell:
+Row Level Security (RLS) aktif pada empat tabel, tetapi kebijakan yang ada memberi role `anon` akses baca, tambah, ubah, dan hapus ke seluruh data. Siapa pun yang dapat mengakses aplikasi berpotensi melihat atau mengubah data.
 
-```powershell
-$env:SUPABASE_URL = "https://PROJECT_REF.supabase.co"
-$env:SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."
-node backend/app.js
-```
-
-## Deploy dari GitHub tanpa folder tambahan
-
-Frontend terhubung langsung ke Supabase menggunakan URL project dan publishable key yang sama di semua perangkat. Backend `localhost` tidak diperlukan saat situs dibuka dari hosting publik; semua data tersimpan di project Supabase tersebut, bukan di penyimpanan lokal HP atau komputer.
-
-1. Pastikan `SUPABASE_URL` dan `SUPABASE_PUBLISHABLE_KEY` di awal `frontend/script.js` menunjuk ke project Supabase yang akan digunakan. Jangan masukkan `service_role` key ke frontend atau GitHub.
-2. Pastikan skema `backend/schema.sql` sudah dijalankan di Supabase SQL Editor.
-3. Push repository ke GitHub.
-4. Hubungkan repository GitHub ke layanan hosting situs statis, lalu atur folder publikasi/build output ke `frontend` dan biarkan build command kosong.
-5. Buka URL HTTPS yang diberikan hosting dari HP, tablet, laptop, atau komputer. Semua perangkat akan membaca dan mengubah database Supabase yang sama selama online.
-
-GitHub Pages dengan pengaturan manual hanya menerbitkan root repository atau folder `docs`, bukan folder `frontend`. Karena struktur repository ini harus tetap hanya memakai folder `frontend` dan `backend`, gunakan hosting statis yang bisa memilih `frontend` sebagai folder publikasi. Tanpa workflow atau salinan file ke root, GitHub Pages tidak dapat menerbitkan struktur ini secara langsung.
-
-Backend Node tetap tersedia untuk pengembangan lokal di `http://localhost:3000`.
-
-**Peringatan keamanan:** skema saat ini memberi role `anon` akses baca/tambah/ubah/hapus ke empat tabel. Publishable key memang boleh tampil di browser, tetapi kebijakan publik tersebut berarti siapa pun dapat mengakses dan mengubah data. Jangan gunakan data gaji atau identitas karyawan nyata sampai autentikasi pengguna dan kebijakan RLS untuk role `authenticated` diterapkan.
-
-## Model kompensasi
-
-- **Tanggal gaji:** `salary_payments.payment_date` default ke hari terakhir dari periode yang dipilih; berbeda dari `paid_at`, yang mencatat tanggal pelunasan aktual.
-- Data karyawan tidak dapat dihapus selama masih memiliki transaksi terkait. Transaksi dapat diedit atau dihapus dari halaman Penggajian.
-- Periode bulanan menggunakan format `YYYY-MM`. Database menghitung total pembayaran dan upah melalui generated columns.
+Konfigurasi ini hanya sesuai untuk demonstrasi atau data latihan. Sebelum menggunakan data karyawan dan penggajian nyata, terapkan autentikasi serta kebijakan RLS untuk role `authenticated` yang membatasi akses sesuai pengguna atau organisasi. Jangan pernah mengekspos `service_role` key.
