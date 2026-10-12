@@ -2,6 +2,20 @@
 
 Arboria adalah aplikasi untuk mengelola data tenaga kerja perkebunan, absensi bulanan, gaji staf tetap, dan upah pemanen berdasarkan bobot hasil panen. Antarmuka dibuat dengan HTML, CSS, dan JavaScript; data terpusat disimpan di Supabase/PostgreSQL.
 
+🌐 **Demo aplikasi:** [Buka Sistem Penggajian dan Pengupahan Perkebunan](https://nabilaawahdah.github.io/Sistem-Penggajian-dan-Pengupahan-Perkebunan/)
+
+## Identitas tugas
+
+| Keterangan | Detail |
+|---|---|
+| Nama | Nabila Wahdah Azzahra |
+| NIM | 12030124130114 |
+| Mata Kuliah | Pengkodean dan Pemograman |
+| Kelas | D |
+| Dosen Pengampu | Dr. Totok Dewayanto, S.E., M.Si., Akt. |
+
+**Disusun untuk memenuhi Tugas Project UTS Pengkodean dan Pemograman.**
+
 ## Fitur Sistem
 
 ### Dashboard
