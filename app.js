@@ -6,8 +6,12 @@ const PORT = Number(process.env.PORT || 3000);
 const FRONTEND_DIR = path.resolve(__dirname, '../frontend');
 const CORS_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '')
   .split(',').map((origin) => origin.trim().replace(/\/$/, '')).filter(Boolean);
-const SUPABASE_URL = (process.env.SUPABASE_URL || 'https://bvxccssjblnuokgkppri.supabase.co').replace(/\/+$/, '');
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_-r4GgHSONExpKhBhcDy5QA_DY8xsr4-';
+const DEFAULT_SUPABASE_URL = 'https://bvxccssjblnuokgkppri.supabase.co';
+const DEFAULT_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_-r4GgHSONExpKhBhcDy5QA_DY8xsr4-';
+const SUPABASE_URL = (process.env.SUPABASE_URL || DEFAULT_SUPABASE_URL).replace(/\/+$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY
+  || process.env.SUPABASE_KEY
+  || (SUPABASE_URL === DEFAULT_SUPABASE_URL ? DEFAULT_SUPABASE_PUBLISHABLE_KEY : '');
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -113,6 +117,14 @@ function validAttendance(period, workingDays, leaveDays, absentDays) {
     && values.reduce((sum, value) => sum + value, 0) <= daysInMonth;
 }
 
+function journalLines(lines) {
+  const sideOrder = (line) => Number(line.debit || 0) > 0 ? 0 : Number(line.credit || 0) > 0 ? 1 : 2;
+  return [...lines].sort((left, right) =>
+    sideOrder(left) - sideOrder(right)
+      || String(left.account_code || '').localeCompare(String(right.account_code || ''))
+      || String(left.id || '').localeCompare(String(right.id || '')));
+}
+
 async function handleApi(request, response, url) {
   try {
     if (request.method === 'GET' && url.pathname === '/api/health') {
@@ -122,17 +134,66 @@ async function handleApi(request, response, url) {
       });
     }
     if (request.method === 'GET' && url.pathname === '/api/data') {
-      const [employees, salaries, harvests, attendance] = await Promise.all([
+      const [employees, salaries, harvests, attendance, dailyAttendance, accounts, journals, journalLines, corrections, auditTrail, harvestBlocks] = await Promise.all([
         supabase('employees', '?select=*&order=created_at.desc'),
         supabase('salary_payments', '?select=*,employees(full_name,employee_code,employment_type,division)&order=created_at.desc'),
         supabase('harvest_records', '?select=*,employees(full_name,employee_code,employment_type,division)&order=created_at.desc'),
-        supabase('attendance_records', '?select=*,employees(full_name,employee_code,employment_type,division)&order=period_id.desc,created_at.desc')
+        supabase('attendance_records', '?select=*,employees(full_name,employee_code,employment_type,division)&order=period_id.desc,created_at.desc'),
+        supabase('daily_attendance', '?select=*,employees(full_name,employee_code,employment_type,division)&order=attendance_date.desc'),
+        supabase('accounts', '?select=*&order=code'),
+        supabase('journals', '?select=*&order=journal_date.desc,created_at.desc'),
+        supabase('journal_lines', '?select=*'),
+        supabase('payroll_corrections', '?select=*&order=created_at.desc'),
+        supabase('payroll_audit_trail', '?select=*&order=occurred_at.desc'),
+        supabase('harvest_blocks', '?select=*&order=code')
       ]);
-      const periods = [...new Set([...salaries, ...harvests].map((entry) => entry.period_id))]
+      const correctionsWithValues = corrections.map((correction) => ({
+        ...correction,
+        correction_values: correction.transaction_kind === 'salary'
+          ? {
+            basic_salary: correction.target_basic_salary,
+            allowances: correction.target_allowances,
+            deductions: correction.target_deductions
+          }
+          : {
+            weight_kg: correction.target_weight_kg,
+            rate_per_kg: correction.target_rate_per_kg
+          }
+      }));
+      const accountsByCode = new Map(accounts.map((account) => [account.code, account]));
+      const journalLinesById = new Map();
+      journalLines.forEach((line) => {
+        const account = accountsByCode.get(line.account_code);
+        const grouped = journalLinesById.get(line.journal_id) || [];
+        grouped.push({ ...line, accounts: account || null });
+        journalLinesById.set(line.journal_id, grouped);
+      });
+      const mappedJournals = journals.map((journal) => ({
+        ...journal,
+        transaction_id: journal.correction_id && journal.journal_type !== 'reversal'
+          ? journal.correction_id
+          : journal.transaction_id,
+        reversal_of: journal.reverses_journal_id,
+        cancellation_reason: journal.reason,
+        payroll_journal_lines: journalLines(journalLinesById.get(journal.id) || [])
+      }))
+        .sort((left, right) => right.journal_date.localeCompare(left.journal_date)
+          || String(right.journal_number || '').localeCompare(String(left.journal_number || '')));
+      const employeesById = new Map(employees.map((employee) => [employee.id, {
+        full_name: employee.full_name,
+        employee_code: employee.employee_code,
+        employment_type: employee.employment_type,
+        division: employee.division
+      }]));
+      const correctionsWithEmployees = correctionsWithValues.map((correction) => ({
+        ...correction,
+        employees: employeesById.get(correction.employee_id) || null
+      }));
+      const periods = [...new Set([...salaries, ...harvests, ...correctionsWithEmployees].map((entry) => entry.period_id))]
         .filter((period) => /^\d{4}-(0[1-9]|1[0-2])$/.test(period))
         .sort((left, right) => right.localeCompare(left))
         .map((period) => ({ id: period, period }));
-      return sendJson(response, 200, { employees, periods, salaries, harvests, attendance });
+      return sendJson(response, 200, { employees, periods, salaries, harvests, corrections: correctionsWithEmployees, attendance, dailyAttendance, accounts, journals: mappedJournals, auditTrail, harvestBlocks });
     }
     const employeeRoute = url.pathname.match(/^\/api\/employees\/([^/]+)$/);
     if (request.method === 'PATCH' && employeeRoute) {
@@ -141,11 +202,42 @@ async function handleApi(request, response, url) {
         return sendJson(response, 400, { error: 'Jenis tenaga kerja tidak valid.' });
       }
       const changes = {};
-      if (body.employee_code !== undefined) changes.employee_code = String(body.employee_code).trim();
+      if (body.employee_code !== undefined) {
+        let employeeCode = String(body.employee_code).trim();
+        if (body.employment_type) {
+          const employeePrefix = body.employment_type === 'staff' ? 'STF-' : 'PNN-';
+          if (!employeeCode.startsWith(employeePrefix)) {
+            employeeCode = employeePrefix + employeeCode.replace(/^(STF-|PNN-)/, '');
+          }
+        }
+        changes.employee_code = employeeCode;
+      }
       if (body.full_name !== undefined) changes.full_name = String(body.full_name).trim();
-      if (body.employment_type !== undefined) changes.employment_type = body.employment_type;
+      if (body.employment_type !== undefined) {
+        changes.employment_type = body.employment_type;
+      }
       if (body.division !== undefined) changes.division = String(body.division).trim();
-      if (body.monthly_salary !== undefined) changes.monthly_salary = Number(body.monthly_salary);
+      let salaryEmploymentType = body.employment_type;
+      if (body.monthly_salary !== undefined && salaryEmploymentType === undefined) {
+        const currentEmployee = await supabase(
+          'employees',
+          `?id=eq.${encodeURIComponent(decodeURIComponent(employeeRoute[1]))}&select=employment_type`
+        );
+        if (!currentEmployee.length) return sendJson(response, 404, { error: 'Karyawan tidak ditemukan.' });
+        salaryEmploymentType = currentEmployee[0].employment_type;
+      }
+      if (salaryEmploymentType === 'harvester') {
+        changes.monthly_salary = 0;
+      } else if (body.monthly_salary !== undefined) {
+        changes.monthly_salary = Number(body.monthly_salary);
+      }
+      if (body.archived_at !== undefined) {
+        if (body.archived_at !== null
+          && (typeof body.archived_at !== 'string' || !Number.isFinite(Date.parse(body.archived_at)))) {
+          return sendJson(response, 400, { error: 'Waktu penghapusan tidak valid.' });
+        }
+        changes.archived_at = body.archived_at === null ? null : new Date(body.archived_at).toISOString();
+      }
       if (!Object.keys(changes).length || Object.values(changes).some((value) => value === '' || (typeof value === 'number' && (!Number.isFinite(value) || value < 0)))) {
         return sendJson(response, 400, { error: 'Data karyawan tidak valid.' });
       }
@@ -157,16 +249,10 @@ async function handleApi(request, response, url) {
     }
     if (request.method === 'DELETE' && employeeRoute) {
       const id = encodeURIComponent(decodeURIComponent(employeeRoute[1]));
-      const employeeFilter = `?employee_id=eq.${id}&select=id&limit=1`;
-      const [salaries, harvests, attendance] = await Promise.all([
-        supabase('salary_payments', employeeFilter),
-        supabase('harvest_records', employeeFilter),
-        supabase('attendance_records', employeeFilter)
-      ]);
-      if (salaries.length || harvests.length || attendance.length) {
-        return sendJson(response, 409, { error: 'Karyawan memiliki transaksi atau absensi. Hapus catatan terkait terlebih dahulu.' });
-      }
-      const rows = await supabase('employees', `?id=eq.${id}`, { method: 'DELETE', prefer: 'return=representation' });
+      const rows = await supabase('employees', `?id=eq.${id}`, {
+        method: 'PATCH', prefer: 'return=representation',
+        body: { archived_at: new Date().toISOString() }
+      });
       if (!rows.length) return sendJson(response, 404, { error: 'Karyawan tidak ditemukan.' });
       return sendJson(response, 200, rows[0]);
     }
@@ -176,14 +262,19 @@ async function handleApi(request, response, url) {
       if (!['staff', 'harvester'].includes(body.employment_type)) {
         return sendJson(response, 400, { error: 'Jenis tenaga kerja tidak valid.' });
       }
+      let employeeCode = String(body.employee_code).trim();
+      const employeePrefix = body.employment_type === 'staff' ? 'STF-' : 'PNN-';
+      if (!employeeCode.startsWith(employeePrefix)) {
+        employeeCode = employeePrefix + employeeCode.replace(/^(STF-|PNN-)/, '');
+      }
       const employees = await supabase('employees', '', {
         method: 'POST', prefer: 'return=representation',
         body: {
-          employee_code: String(body.employee_code).trim(),
+          employee_code: employeeCode,
           full_name: String(body.full_name).trim(),
           employment_type: body.employment_type,
           division: String(body.division).trim(),
-          monthly_salary: Number(body.monthly_salary || 0)
+          monthly_salary: body.employment_type === 'harvester' ? 0 : Number(body.monthly_salary || 0)
         }
       });
       return sendJson(response, 201, employees[0]);
@@ -208,6 +299,34 @@ async function handleApi(request, response, url) {
         body: { employee_id: body.employee_id, period_id: body.period, ...values }
       });
       return sendJson(response, 201, rows[0]);
+    }
+    if (request.method === 'POST' && url.pathname === '/api/attendance/daily') {
+      const body = await readJson(request);
+      const attendanceDate = new Date(`${body.attendance_date}T00:00:00Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(body.attendance_date || '')
+        || Number.isNaN(attendanceDate.getTime())
+        || attendanceDate.toISOString().slice(0, 10) !== body.attendance_date
+        || !Array.isArray(body.records) || !body.records.length) {
+        return sendJson(response, 400, { error: 'Tanggal dan daftar status absensi wajib diisi.' });
+      }
+      if (body.records.some((record) => !record.employee_id || !['present', 'leave', 'absent'].includes(record.status))) {
+        return sendJson(response, 400, { error: 'Setiap karyawan harus memiliki status Hadir, Izin, atau Alfa.' });
+      }
+      const employeeIds = [...new Set(body.records.map((record) => record.employee_id))];
+      if (employeeIds.length !== body.records.length) {
+        return sendJson(response, 400, { error: 'Karyawan tidak boleh tercatat lebih dari sekali pada tanggal yang sama.' });
+      }
+      const rows = await supabase('daily_attendance', '?on_conflict=employee_id,attendance_date', {
+        method: 'POST',
+        prefer: 'resolution=merge-duplicates,return=representation',
+        body: body.records.map((record) => ({
+          employee_id: record.employee_id,
+          attendance_date: body.attendance_date,
+          status: record.status,
+          recorded_by: 'Admin Arboria'
+        }))
+      });
+      return sendJson(response, 200, rows);
     }
     const attendanceRoute = url.pathname.match(/^\/api\/attendance\/([^/]+)$/);
     if (request.method === 'PATCH' && attendanceRoute) {
@@ -264,15 +383,19 @@ async function handleApi(request, response, url) {
       return sendJson(response, 201, rows[0]);
     }
     if (request.method === 'POST' && url.pathname === '/api/harvests') {
-      const body = sanitizePayload(await readJson(request), ['employee_id', 'period', 'harvest_date', 'weight_kg', 'rate_per_kg', 'status']);
-      requireFields(body, ['employee_id', 'period', 'weight_kg', 'rate_per_kg']);
+      const body = sanitizePayload(await readJson(request), ['employee_id', 'period', 'harvest_date', 'block_code', 'commodity', 'unit', 'weight_kg', 'rate_per_kg', 'deductions', 'status']);
+      requireFields(body, ['employee_id', 'period', 'block_code', 'weight_kg', 'rate_per_kg']);
       const periodId = await ensurePeriod(body.period);
       const rows = await supabase('harvest_records', '', {
         method: 'POST', prefer: 'return=representation',
         body: {
           employee_id: body.employee_id, period_id: periodId,
+          block_code: String(body.block_code).trim(),
+          commodity: String(body.commodity || '').trim() || null,
+          unit: String(body.unit || '').trim() || null,
           harvest_date: body.harvest_date || new Date().toISOString().slice(0, 10),
           weight_kg: Number(body.weight_kg), rate_per_kg: Number(body.rate_per_kg),
+          deductions: 0,
           status: body.status || 'paid',
           paid_at: (body.status || 'paid') === 'paid' ? new Date().toISOString() : null
         }
@@ -280,8 +403,51 @@ async function handleApi(request, response, url) {
       return sendJson(response, 201, rows[0]);
     }
     const payrollRoute = url.pathname.match(/^\/api\/(salaries|harvests)\/([^/]+)$/);
+    const cancellationRoute = url.pathname.match(/^\/api\/(salaries|harvests)\/([^/]+)\/cancel$/);
+    if (request.method === 'POST' && cancellationRoute) {
+      const body = await readJson(request);
+      requireFields(body, ['reason']);
+      if (!String(body.reason).trim()) return sendJson(response, 400, { error: 'Alasan pembatalan wajib diisi.' });
+      const result = await supabase('rpc/cancel_payroll_transaction', '', {
+        method: 'POST',
+        body: {
+          transaction_type: cancellationRoute[1] === 'salaries' ? 'salary' : 'harvest',
+          transaction_key: decodeURIComponent(cancellationRoute[2]),
+          reason: String(body.reason).trim()
+        }
+      });
+      return sendJson(response, 200, { reversal_journal_id: result });
+    }
+    const correctionRoute = url.pathname.match(/^\/api\/(salaries|harvests)\/([^/]+)\/correct$/);
+    if (request.method === 'POST' && correctionRoute) {
+      const body = await readJson(request);
+      requireFields(body, ['values', 'reason']);
+      if (!String(body.reason).trim()) return sendJson(response, 400, { error: 'Alasan koreksi wajib diisi.' });
+      const correctionId = await supabase('rpc/correct_payroll_transaction', '', {
+        method: 'POST',
+        body: {
+          transaction_type: correctionRoute[1] === 'salaries' ? 'salary' : 'harvest',
+          transaction_key: decodeURIComponent(correctionRoute[2]),
+          correction_values: body.values,
+          reason: String(body.reason).trim()
+        }
+      });
+      return sendJson(response, 201, { correction_id: correctionId });
+    }
+    const correctionPaymentRoute = url.pathname.match(/^\/api\/corrections\/([^/]+)\/pay$/);
+    if (request.method === 'POST' && correctionPaymentRoute) {
+      const correctionId = await supabase('rpc/payroll_correction_payment', '', {
+        method: 'POST',
+        body: { correction_key: decodeURIComponent(correctionPaymentRoute[1]) }
+      });
+      return sendJson(response, 200, { correction_id: correctionId });
+    }
     if (request.method === 'PATCH' && payrollRoute) {
-      const body = sanitizePayload(await readJson(request), ['employee_id', 'period', 'status', 'paid_at', 'basic_salary', 'allowances', 'deductions', 'payment_date', 'harvest_date', 'weight_kg', 'rate_per_kg']);
+      const requestBody = await readJson(request);
+      if (Object.prototype.hasOwnProperty.call(requestBody, 'paid_at')) {
+        return sendJson(response, 400, { error: 'Tanggal pembayaran transaksi terkunci dan tidak dapat diubah.' });
+      }
+      const body = sanitizePayload(requestBody, ['employee_id', 'period', 'status', 'basic_salary', 'allowances', 'deductions', 'payment_date', 'harvest_date', 'weight_kg', 'rate_per_kg']);
       const isSalary = payrollRoute[1] === 'salaries';
       const table = isSalary ? 'salary_payments' : 'harvest_records';
       const changes = {};
@@ -293,13 +459,6 @@ async function handleApi(request, response, url) {
       if (body.status !== undefined) {
         changes.status = body.status;
         changes.paid_at = body.status === 'paid' ? new Date().toISOString() : null;
-      }
-      if (body.paid_at !== undefined) {
-        const paidDate = new Date(`${body.paid_at}T12:00:00.000Z`);
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(body.paid_at) || Number.isNaN(paidDate.getTime()) || paidDate.toISOString().slice(0, 10) !== body.paid_at) {
-          return sendJson(response, 400, { error: 'Tanggal pembayaran tidak valid.' });
-        }
-        changes.paid_at = paidDate.toISOString();
       }
       if (isSalary) {
         for (const field of ['basic_salary', 'allowances', 'deductions']) {
@@ -313,7 +472,7 @@ async function handleApi(request, response, url) {
         }
       } else {
         if (body.harvest_date !== undefined) changes.harvest_date = body.harvest_date;
-        for (const field of ['weight_kg', 'rate_per_kg']) {
+        for (const field of ['weight_kg', 'rate_per_kg', 'deductions']) {
           if (body[field] !== undefined) changes[field] = Number(body[field]);
         }
       }
@@ -334,12 +493,7 @@ async function handleApi(request, response, url) {
       return sendJson(response, 200, rows[0]);
     }
     if (request.method === 'DELETE' && payrollRoute) {
-      const table = payrollRoute[1] === 'salaries' ? 'salary_payments' : 'harvest_records';
-      const rows = await supabase(table, `?id=eq.${encodeURIComponent(decodeURIComponent(payrollRoute[2]))}`, {
-        method: 'DELETE', prefer: 'return=representation'
-      });
-      if (!rows.length) return sendJson(response, 404, { error: 'Transaksi tidak ditemukan.' });
-      return sendJson(response, 200, rows[0]);
+      return sendJson(response, 405, { error: 'Transaksi terkunci dan tidak dapat dihapus. Gunakan Koreksi atau Batal.' });
     }
     return sendJson(response, 404, { error: 'Endpoint tidak ditemukan.' });
   } catch (error) {
