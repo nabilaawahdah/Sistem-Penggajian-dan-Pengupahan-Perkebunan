@@ -997,4 +997,1549 @@ function paymentSlipHtml(entry, printCount = slipPrintCount(entry)) {
           <div style="font-family: 'Great Vibes', 'Segoe Script', 'Lucida Handwriting', cursive; font-size: 25px; min-height: 52px; color: var(--color-sidebar); margin-bottom: 10px;">${escapeHtml(employeeSignature)}</div>
           <div style="height: 2px; background: linear-gradient(to right, var(--color-line), var(--color-sidebar), var(--color-line)); margin: 0 auto 10px; width: 90%;"></div>
           <div style="font-size: 13px; font-weight: 700; color: var(--color-sidebar);">${escapeHtml(employee.full_name || 'Nama Karyawan')}</div>
-        </div>
+        </div>      </div>
+
+      <div style="margin-top: 30px; text-align: center; color: var(--color-text-muted); font-size: 9px; letter-spacing: 0.05em; font-style: italic;">Dokumen ini diterbitkan secara sah melalui Sistem Penggajian dan Pengupahan Perkebunan Arboria.</div>
+    </div>
+  `;
+}
+function resizeSlipPreview() {
+  const backdrop = document.querySelector('#slip-preview-backdrop');
+  const scroll = document.querySelector('.slip-preview-scroll');
+  const stage = document.querySelector('#slip-preview-stage');
+  const documentSheet = document.querySelector('.payment-slip-document');
+  if (backdrop.hidden || !scroll || !stage || !documentSheet) return;
+  const scale = Math.min(1, Math.max(0.3, (scroll.clientWidth - 24) / 794));
+  stage.style.width = `${794 * scale}px`;
+  stage.style.height = `${documentSheet.offsetHeight * scale}px`;
+  documentSheet.style.transform = `scale(${scale})`;
+  documentSheet.style.transformOrigin = 'top left';
+}
+function openPaymentSlipPreview(entry) {
+  if (!entry?.slip_number) return;
+  const employee = employeeFor(entry);
+  state.previewSlip = entry;
+  document.querySelector('#slip-preview-title').textContent = `Slip Pembayaran ${entry.kind === 'salary' ? 'Gaji' : 'Upah'}`;
+  document.querySelector('#slip-preview-employee').textContent = `${employee.full_name || 'Karyawan'} · ${employee.employee_code || '—'}`;
+  document.querySelector('#slip-preview-sheet').innerHTML = paymentSlipHtml(entry);
+  document.querySelector('#slip-preview-backdrop').hidden = false;
+  document.body.style.overflow = 'hidden';
+  document.fonts.ready.then(() => requestAnimationFrame(resizeSlipPreview));
+  requestAnimationFrame(resizeSlipPreview);
+}
+function closePaymentSlipPreview() {
+  document.querySelector('#slip-preview-backdrop').hidden = true;
+  document.querySelector('#slip-preview-sheet').replaceChildren();
+  state.previewSlip = null;
+  document.body.style.overflow = '';
+}
+async function downloadPaymentSlip(entry, button) {
+  if (!entry?.slip_number) return;
+  if (!window.html2canvas || !window.jspdf) {
+    showToast('PDF slip tidak tersedia. Mohon refresh halaman dan coba kembali.');
+    return;
+  }
+  button.disabled = true;
+  const wrapper = document.createElement('div');
+  wrapper.id = 'slip-render-root';
+  const printCount = slipPrintCount(entry);
+  wrapper.innerHTML = paymentSlipHtml(entry, printCount);
+  wrapper.style.position = 'fixed';
+  wrapper.style.left = '-9999px';
+  wrapper.style.top = '0';
+  wrapper.style.width = '794px';
+  wrapper.style.height = '1123px';
+  wrapper.style.overflow = 'hidden';
+  document.body.appendChild(wrapper);
+  try {
+    await document.fonts.ready;
+    const canvas = await window.html2canvas(wrapper, {
+      scale: 2,
+      backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--color-surface').trim(),
+      useCORS: true,
+      width: 794,
+      height: 1123,
+      onclone: (clonedDocument) => {
+        const clonedWrapper = clonedDocument.querySelector('#slip-render-root');
+        if (clonedWrapper) {
+          clonedWrapper.style.visibility = 'visible';
+          clonedWrapper.style.left = '0';
+          clonedWrapper.style.top = '0';
+        }
+      },
+    });
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const imageWidth = pageWidth - 48;
+    const imageHeight = (canvas.height * imageWidth) / canvas.width;
+    const imgData = canvas.toDataURL('image/png');
+    const finalHeight = Math.min(imageHeight, pageHeight - 48);
+    pdf.addImage(imgData, 'PNG', 24, 24, imageWidth, finalHeight);
+    pdf.setFontSize(8);
+    pdf.text('Halaman 1', pageWidth - 24, pageHeight - 12, { align: 'right' });
+    pdf.save(paymentSlipFilename(entry));
+    const printCounts = JSON.parse(localStorage.getItem('arboria-slip-print-counts') || '{}');
+    printCounts[entry.id] = printCount + 1;
+    localStorage.setItem('arboria-slip-print-counts', JSON.stringify(printCounts));
+    document.querySelector('#slip-preview-sheet').innerHTML = paymentSlipHtml(entry, printCount + 1);
+    document.fonts.ready.then(() => requestAnimationFrame(resizeSlipPreview));
+    showToast('Slip pembayaran berhasil diunduh dalam format PDF.');
+  } catch (error) {
+    showToast(error.message || 'Slip pembayaran gagal dibuat.');
+  } finally {
+    wrapper.remove();
+    button.disabled = false;
+  }
+}
+window.addEventListener('resize', resizeSlipPreview);
+function transactionMarkup(entry, withActions = false, hideType = false) {
+  const employee = employeeFor(entry);
+  const isSalary = entry.kind === 'salary';
+  const linkedCorrections = !entry.is_correction
+    ? state.data.corrections.filter((correction) => correction.original_transaction_id === entry.id)
+    : [];
+  const paidBeforeAdjustments = Number(entry.total_amount || 0) + linkedCorrections.reduce((sum, correction) => {
+    if (correction.paid_with_original) return sum + Number(correction.net_amount || 0);
+    if (correction.slip_number && correction.paid_at && Number(correction.net_amount) > 0) {
+      return sum + Number(correction.net_amount);
+    }
+    return sum;
+  }, 0);
+  const overpaidAmount = !entry.is_correction && (entry.status === 'paid' || (entry.status === 'cancelled' && entry.paid_at))
+    ? Math.max(0, roundAmount(paidBeforeAdjustments - Number(entry.amount || 0)))
+    : 0;
+  const finalValues = linkedCorrections.length ? correctionBaseline(entry) : null;
+  const detail = entry.is_correction
+    ? isSalary
+      ? `<span>Pokok ${formatSignedMoney(entry.delta_basic_salary)}</span><span>Tunj. ${formatSignedMoney(entry.delta_allowances)}</span><span>Potongan ${formatSignedMoney(entry.delta_deductions)}</span>`
+      : `<span>Selisih upah ${formatSignedMoney(entry.delta_gross)}</span>`
+    : isSalary
+    ? `<span>Pokok ${formatMoney(finalValues?.basic_salary ?? entry.basic_salary)}</span><span>Tunj. ${formatMoney(finalValues?.allowances ?? entry.allowances ?? 0)}</span><span>Potongan ${formatMoney(finalValues?.deductions ?? entry.deductions ?? 0)}</span>`
+    : `<span>Blok ${entry.block_code || employee.division || '—'}${entry.commodity || harvestBlockFor(entry.block_code || employee.division).commodity ? ` · ${entry.commodity || harvestBlockFor(entry.block_code || employee.division).commodity}` : ''}</span><span>${number.format(finalValues?.weight_kg ?? entry.weight_kg)} ${entry.unit || harvestBlockFor(entry.block_code || employee.division).unit || 'satuan'} × ${formatMoney(finalValues?.rate_per_kg ?? entry.rate_per_kg)} / ${entry.unit || harvestBlockFor(entry.block_code || employee.division).unit || 'satuan'}</span>`;
+  const status = entry.status === 'cancelled' ? 'Dibatalkan'
+    : entry.status === 'overpaid' ? 'Kelebihan bayar'
+    : entry.status === 'pending' ? 'Menunggu pembayaran' : 'Dibayar';
+  const original = entry.is_correction
+    ? [...state.data.salaries, ...state.data.harvests].find((item) => item.id === entry.original_transaction_id)
+    : null;
+  const statusMarkup = entry.status === 'cancelled'
+    ? `<span class="status-tag status-cancelled">${status}</span>`
+    : entry.status === 'overpaid'
+    ? `<span class="status-tag status-overpaid">${status}</span>`
+    : entry.status === 'pending'
+    ? `<span class="status-tag status-pending">${status}</span>${entry.is_correction
+      ? original?.status === 'paid' && Number(entry.net_amount) > 0
+        ? `<button class="status-tag status-action" type="button" data-mark-correction-paid="${escapeHtml(entry.id)}">Tandai dibayar</button>`
+        : ''
+      : `<button class="status-tag status-action" type="button" data-mark-paid="${isSalary ? 'salary' : 'harvest'}" data-entry-id="${escapeHtml(entry.id)}">Tandai dibayar</button>`}`
+    : `<span class="status-tag">${status}</span>`;
+  const statusDetail = entry.is_correction && entry.status === 'overpaid'
+    ? `Kelebihan bayar ${formatMoney(Math.abs(Number(entry.net_amount || 0)))}`
+    : !entry.is_correction && overpaidAmount > 0
+      ? `Kelebihan bayar ${formatMoney(overpaidAmount)}`
+      : statusDetails(entry);
+  const overpaidStatus = !entry.is_correction && overpaidAmount > 0
+    ? '<span class="status-tag status-overpaid">Kelebihan bayar</span>'
+    : '';
+  const reference = entry.is_correction && original ? `Koreksi ${original.slip_number || '—'}` : '';
+  const amountNote = entry.is_correction
+    ? '<small class="status-detail">Dibayar sekarang</small>'
+    : linkedCorrections.length ? '<span class="status-tag status-corrected">Dikoreksi</span>' : '';
+  return `<tr class="${entry.status === 'cancelled' ? 'cancelled-transaction' : ''}"><td>${personMarkup(employee)}</td><td><span class="slip-number">${escapeHtml(entry.slip_number || '—')}</span>${reference ? `<small class="status-detail">${escapeHtml(reference)}</small>` : ''}</td>${hideType ? '' : `<td><span class="type-tag ${isSalary ? '' : 'harvest'}"><i></i>${isSalary ? 'Gaji staf' : 'Upah panen'}${entry.is_correction ? ' · Koreksi' : ''}</span></td>`}<td><span class="date-cell"><strong>${escapeHtml(transactionDate(entry))}</strong><small>${escapeHtml(monthLabel(periodFor(entry)))}</small></span></td><td><span class="transaction-detail">${detail}</span></td><td class="money-cell">${formatMoney(entry.amount)}${amountNote}</td><td><div class="status-cell">${statusMarkup}${overpaidStatus}${statusDetail ? `<small class="status-detail">${escapeHtml(statusDetail)}</small>` : ''}</div></td>${withActions ? `<td>${transactionActions(entry)}</td>` : ''}</tr>`;
+}
+function renderTransactions() {
+  const recent = currentTransactions().filter((entry) => entry.status !== 'cancelled').slice(0, 5);
+  document.querySelector('#recent-transactions').innerHTML = recent.map((entry) => transactionMarkup(entry, true)).join('');
+  document.querySelector('#recent-empty').hidden = recent.length > 0;
+}
+function renderEmployees() {
+  const activeEmployees = state.data.employees.filter((employee) => !employee.archived_at);
+  const archivedEmployees = state.data.employees.filter((employee) => Boolean(employee.archived_at));
+  const staff = activeEmployees.filter((employee) => employee.employment_type === 'staff');
+  const harvesters = activeEmployees.filter((employee) => employee.employment_type === 'harvester');
+  document.querySelector('#filter-all-count').textContent = activeEmployees.length;
+  document.querySelector('#filter-staff-count').textContent = staff.length;
+  document.querySelector('#filter-harvester-count').textContent = harvesters.length;
+  document.querySelector('#filter-archived-count').textContent = archivedEmployees.length;
+  const search = state.search.toLowerCase();
+  const employees = state.data.employees.filter((employee) => {
+    const matchesStatus = state.employeeFilter === 'deleted'
+      ? Boolean(employee.archived_at)
+      : !employee.archived_at
+        && (state.employeeFilter === 'all' || employee.employment_type === state.employeeFilter);
+    return matchesStatus && `${employee.full_name} ${employee.employee_code} ${employee.division}`.toLowerCase().includes(search);
+  });
+  document.querySelector('#employee-rows').innerHTML = employees.map((employee) => {
+    const typeLabel = employee.employment_type === 'staff' ? 'Staf' : 'Pemanen';
+    const compensation = employee.employment_type === 'staff' ? `${formatMoney(employee.monthly_salary)} / bulan` : 'Tarif berdasarkan panen';
+    return `<tr><td>${personMarkup(employee)}</td><td>${escapeHtml(employee.employee_code)}</td><td><span class="role-tag ${employee.employment_type}">${typeLabel}</span></td><td>${escapeHtml(employee.division)}</td><td class="compensation-cell">${compensation}</td><td>${employeeActions(employee)}</td></tr>`;
+  }).join('');
+  document.querySelector('#employee-empty').hidden = employees.length > 0;
+  document.querySelector('#employee-result-count').textContent = `${employees.length} karyawan`;
+}
+function attendancePeriodRecords(period = state.attendancePeriod || currentPeriod()) {
+  return state.data.dailyAttendance.filter((entry) => reportPeriodMatches(entry.attendance_date, period));
+}
+function renderAttendance() {
+  const dateInput = document.querySelector('#attendance-date');
+  if (!dateInput.value) dateInput.value = new Date().toISOString().slice(0, 10);
+  const attendanceDate = dateInput.value;
+  const currentDay = new Map(state.data.dailyAttendance.filter((entry) => entry.attendance_date === attendanceDate).map((entry) => [entry.employee_id, entry.status]));
+  const dailyQuery = document.querySelector('#attendance-search').value.trim().toLowerCase();
+  const dailyType = document.querySelector('#attendance-type-filter').value;
+  const dailyEmployees = state.data.employees.filter((employee) => !employee.archived_at
+    && (dailyType === 'all' || employee.employment_type === dailyType)
+    && `${employee.full_name} ${employee.employee_code}`.toLowerCase().includes(dailyQuery));
+  document.querySelector('#daily-attendance-rows').innerHTML = dailyEmployees.map((employee) => {
+    const status = state.dailyStatuses[employee.id] || currentDay.get(employee.id) || '';
+    const choices = [['present', 'Hadir'], ['leave', 'Izin'], ['absent', 'Alfa']].map(([value, label]) =>
+      `<label class="attendance-choice ${value} ${status === value ? 'selected' : ''}"><input type="radio" name="daily-${escapeHtml(employee.id)}" value="${value}" data-attendance-status="${escapeHtml(employee.id)}" ${status === value ? 'checked' : ''}><span>${label}</span></label>`).join('');
+    const typeLabel = employee.employment_type === 'staff' ? 'Staf' : 'Pemanen';
+    return `<tr><td>${personMarkup(employee)}</td><td>${escapeHtml(employee.employee_code)}</td><td><span class="role-tag ${employee.employment_type}">${typeLabel}</span></td><td><div class="attendance-choices">${choices}</div></td></tr>`;
+  }).join('');
+  document.querySelector('#daily-attendance-empty').hidden = dailyEmployees.length > 0;
+  document.querySelector('#daily-attendance-count').textContent = `${dailyEmployees.length} karyawan`;
+  document.querySelector('#attendance-count').textContent = attendancePeriodRecords().length;
+
+  const period = state.attendancePeriod || currentPeriod();
+  const attendanceRows = attendancePeriodRecords(period);
+  const legacyRows = state.data.attendance.filter((entry) => reportPeriodMatches(entry.period_id, period)
+    && !state.data.dailyAttendance.some((daily) => daily.employee_id === entry.employee_id && daily.attendance_date.slice(0, 7) === entry.period_id));
+  const byEmployee = new Map();
+  for (const entry of attendanceRows) {
+    const item = byEmployee.get(entry.employee_id) || { present: 0, leave: 0, absent: 0, records: [], legacy: [] };
+    item[entry.status] += 1;
+    item.records.push(entry);
+    byEmployee.set(entry.employee_id, item);
+  }
+  for (const entry of legacyRows) {
+    const item = byEmployee.get(entry.employee_id) || { present: 0, leave: 0, absent: 0, records: [], legacy: [] };
+    item.present += Number(entry.working_days || 0);
+    item.leave += Number(entry.leave_days || 0);
+    item.absent += Number(entry.absent_days || 0);
+    item.legacy.push(entry);
+    byEmployee.set(entry.employee_id, item);
+  }
+  const reportType = document.querySelector('#attendance-report-type').value;
+  const reportQuery = document.querySelector('#attendance-report-search').value.trim().toLowerCase();
+  const employees = state.data.employees.filter((employee) => {
+    return (reportType === 'all' || employee.employment_type === reportType)
+      && `${employee.full_name} ${employee.employee_code}`.toLowerCase().includes(reportQuery);
+  });
+  const totalLeave = employees.reduce((sum, employee) => sum + (byEmployee.get(employee.id)?.leave || 0), 0);
+  const totalAbsent = employees.reduce((sum, employee) => sum + (byEmployee.get(employee.id)?.absent || 0), 0);
+  document.querySelector('#attendance-summary').innerHTML = `<article class="summary-item"><span>Total karyawan</span><strong>${employees.length}</strong><small>${escapeHtml(selectionLabel(period))}</small></article><article class="summary-item"><span>Total izin</span><strong>${totalLeave}</strong><small>Total periode terpilih</small></article><article class="summary-item"><span>Total alfa</span><strong>${totalAbsent}</strong><small>Total periode terpilih</small></article>`;
+  document.querySelector('#attendance-rows').innerHTML = employees.map((employee) => {
+    const detail = byEmployee.get(employee.id) || { present: 0, leave: 0, absent: 0 };
+    return `<tr><td><button class="text-button attendance-detail-link" type="button" data-attendance-detail="${escapeHtml(employee.id)}">${escapeHtml(employee.full_name)}</button></td><td>${escapeHtml(employee.employee_code)}</td><td><span class="role-tag ${employee.employment_type}">${employee.employment_type === 'staff' ? 'Staf' : 'Pemanen'}</span></td><td><span class="attendance-status present">${detail.present}</span></td><td><span class="attendance-status leave">${detail.leave}</span></td><td><span class="attendance-status absent">${detail.absent}</span></td></tr>`;
+  }).join('');
+  document.querySelector('#attendance-empty').hidden = employees.length > 0;
+  document.querySelector('#attendance-result-count').textContent = `${employees.length} karyawan`;
+}
+function renderPayroll() {
+  const filtered = currentTransactions().filter((entry) => {
+    if (state.payrollFilter === 'pending') return entry.status === 'pending';
+    return state.payrollFilter === 'all' || entry.kind === state.payrollFilter;
+  });
+  const active = filtered.filter((entry) => !entry.is_correction && entry.status !== 'cancelled');
+  const salaryTotal = active.filter((entry) => entry.kind === 'salary').reduce((sum, entry) => sum + entry.amount, 0);
+  const wageEntries = active.filter((entry) => entry.kind === 'harvest');
+  const wageTotal = wageEntries.reduce((sum, entry) => sum + entry.amount, 0);
+  document.querySelector('#payroll-summary').innerHTML = `<article class="summary-item"><span>Total gaji staf</span><strong>${formatMoney(salaryTotal)}</strong><small>${active.filter((entry) => entry.kind === 'salary').length} transaksi aktif</small></article><article class="summary-item"><span>Total upah panen</span><strong>${formatMoney(wageTotal)}</strong><small>${number.format(wageEntries.reduce((sum, entry) => sum + Number(entry.weight_kg || 0), 0))} kg tercatat</small></article><article class="summary-item"><span>Total kompensasi</span><strong>${formatMoney(salaryTotal + wageTotal)}</strong><small>${active.length} transaksi aktif</small></article>`;
+  document.querySelector('#payroll-rows').innerHTML = filtered.map((entry) => transactionMarkup(entry, true, true)).join('');
+  document.querySelector('#payroll-empty').hidden = filtered.length > 0;
+  document.querySelector('#payroll-result-count').textContent = `${filtered.length} transaksi`;
+}
+function reportPeriodMatches(date, period) {
+  if (!date) return false;
+  return isYearSelection(period) ? date.startsWith(`${period.slice(5)}-`) : date.slice(0, 7) === period;
+}
+function journalDate(journal) { return String(journal.journal_date || journal.created_at || '').slice(0, 10); }
+function journalCreatedAt(journal) { return String(journal.created_at || `${journalDate(journal)}T00:00:00`); }
+function journalLines(journal) {
+  return (journal.payroll_journal_lines || journal.lines || [])
+    .map((line, index) => ({ line, index }))
+    .sort((left, right) => {
+      const sideOrder = (line) => Number(line.debit || 0) > 0 ? 0 : Number(line.credit || 0) > 0 ? 1 : 2;
+      return sideOrder(left.line) - sideOrder(right.line)
+        || String(left.line.account_code || '').localeCompare(String(right.line.account_code || ''))
+        || String(left.line.id || '').localeCompare(String(right.line.id || ''))
+        || left.index - right.index;
+    })
+    .map(({ line }) => line);
+}
+function journalTotals(journals) {
+  return journals.reduce((total, journal) => journalLines(journal).reduce((sum, line) => ({
+    debit: sum.debit + Number(line.debit || 0),
+    credit: sum.credit + Number(line.credit || 0)
+  }), total), { debit: 0, credit: 0 });
+}
+function getAccount(code) {
+  return state.data.accounts.find((account) => account.code === code) || { code, name: code, normal_balance: 'debit', account_type: '—' };
+}
+function journalTypeLabel(type) {
+  return ({ recognition: 'Pengakuan', salary: 'Pengakuan', harvest: 'Pengakuan', payment: 'Pembayaran', correction: 'Koreksi', reversal: 'Pembalik' })[type] || type;
+}
+function journalEvidence(journal) {
+  const transaction = [...state.data.salaries, ...state.data.harvests, ...state.data.corrections].find((entry) => entry.id === journal.transaction_id);
+  const correctionSource = transaction?.original_transaction_id
+    ? [...state.data.salaries, ...state.data.harvests].find((entry) => entry.id === transaction.original_transaction_id)
+    : null;
+  return transaction?.slip_number || correctionSource?.slip_number
+    || (/^JU-\d{4}-/.test(journal.journal_number || '') ? '—' : journal.journal_number) || '—';
+}
+function reversalSourceOrder(journal) {
+  const source = state.data.journals.find((item) => item.id === journal.reversal_of);
+  if (!source) return ['\uffff', 4, String(journal.reversal_of || journal.id || '')];
+  return [journalCreatedAt(source), journalTypeOrder(source), String(source.id || '')];
+}
+function journalTypeOrder(journal) {
+  if (['recognition', 'salary', 'harvest'].includes(journal.journal_type)) return 0;
+  if (journal.journal_type === 'correction') return 1;
+  if (journal.journal_type === 'payment') return 2;
+  if (journal.journal_type === 'reversal') return 3;
+  return 4;
+}
+function compareReversalSourceOrder(left, right) {
+  const leftOrder = reversalSourceOrder(left);
+  const rightOrder = reversalSourceOrder(right);
+  return leftOrder[0].localeCompare(rightOrder[0])
+    || leftOrder[1] - rightOrder[1]
+    || leftOrder[2].localeCompare(rightOrder[2]);
+}
+function compareJournalOrder(left, right) {
+  const byCreatedAt = journalCreatedAt(left).localeCompare(journalCreatedAt(right));
+  if (byCreatedAt) return byCreatedAt;
+  const byType = journalTypeOrder(left) - journalTypeOrder(right);
+  if (byType) return byType;
+  const byDate = journalDate(left).localeCompare(journalDate(right));
+  if (byDate) return byDate;
+  return String(left.transaction_kind || '').localeCompare(String(right.transaction_kind || ''))
+    || String(left.transaction_id || '').localeCompare(String(right.transaction_id || ''))
+    || String(left.id || '').localeCompare(String(right.id || ''));
+}
+function journalBlocks(journals) {
+  const blocks = [];
+  const reversalBlocks = new Map();
+  for (const journal of journals) {
+    if (journal.journal_type !== 'reversal') {
+      blocks.push({ journals: [journal], isReversalGroup: false });
+      continue;
+    }
+    const key = `${journal.transaction_kind}:${journal.transaction_id || journal.id}`;
+    let block = reversalBlocks.get(key);
+    if (!block) {
+      block = { journals: [], isReversalGroup: true };
+      reversalBlocks.set(key, block);
+      blocks.push(block);
+    }
+    block.journals.push(journal);
+  }
+  for (const block of reversalBlocks.values()) {
+    block.journals.sort(compareReversalSourceOrder);
+  }
+  return blocks;
+}
+function journalBlockLines(block) {
+  return block.journals.flatMap((journal, journalIndex) =>
+    journalLines(journal).map((line, lineIndex) => ({ journal, journalIndex, lineIndex, line })));
+}
+function journalBlockDescription(block) {
+  if (!block.isReversalGroup) return block.journals[0].description;
+  const first = block.journals[0];
+  const transaction = [...state.data.salaries, ...state.data.harvests]
+    .find((entry) => entry.id === first.transaction_id);
+  const rawDescription = block.journals
+    .map((journal) => journal.description || '')
+    .find((description) => description.includes(':')) || '';
+  const reasonFromDescription = rawDescription.includes(':')
+    ? rawDescription.slice(rawDescription.indexOf(':') + 1).trim() : '';
+  const reason = first.cancellation_reason || transaction?.cancellation_reason
+    || reasonFromDescription
+    || 'Pembatalan transaksi';
+  return `Pembalik ${journalEvidence(first)}: ${reason}`;
+}
+function matchingJournals(period, type = 'all') {
+  const filtered = state.data.journals.filter((journal) => reportPeriodMatches(journalDate(journal), period)
+    && (type === 'all'
+      || (type === 'recognition' && ['recognition', 'salary', 'harvest'].includes(journal.journal_type))
+      || journal.journal_type === type));
+  return filtered.sort(compareJournalOrder);
+}
+function renderDashboardAccounting() {
+  const journals = matchingJournals(state.selectedPeriod);
+  const journalTotalsForPeriod = journalTotals(journals);
+  document.querySelector('#dashboard-accounting-period').textContent = selectionLabel(state.selectedPeriod);
+  document.querySelector('#dashboard-journal-count').textContent = `${journals.length} jurnal`;
+  document.querySelector('#dashboard-journal-debit').textContent = formatMoney(journalTotalsForPeriod.debit);
+  document.querySelector('#dashboard-journal-credit').textContent = formatMoney(journalTotalsForPeriod.credit);
+  const recentJournals = journals.slice(-3);
+  document.querySelector('#dashboard-journal-activity').innerHTML = recentJournals.length
+    ? recentJournals.map((journal) => `<div class="dashboard-journal-row"><div class="dashboard-journal-description"><strong>${escapeHtml(journalEvidence(journal))}</strong><span>${escapeHtml(journal.description || journalTypeLabel(journal.journal_type))}</span></div><div class="dashboard-journal-meta"><span class="dashboard-journal-type">${escapeHtml(journalTypeLabel(journal.journal_type))}</span><time>${escapeHtml(formatDate(journalDate(journal)))}</time></div></div>`).join('')
+    : '<p class="dashboard-journal-empty">Belum ada jurnal pada periode ini.</p>';
+
+  const { end } = periodDateRange(state.selectedPeriod);
+  const trialBalance = state.data.accounts.reduce((total, account) => {
+    const balance = accountMovements(account, end).balance;
+    const debitBalance = account.normal_balance === 'debit' ? balance : -balance;
+    total.debit += Math.max(0, debitBalance);
+    total.credit += Math.max(0, -debitBalance);
+    if (Math.abs(balance) >= 0.005) total.accountsWithBalance += 1;
+    return total;
+  }, { debit: 0, credit: 0, accountsWithBalance: 0 });
+  const balanced = Math.abs(trialBalance.debit - trialBalance.credit) < 0.005;
+  document.querySelector('#dashboard-ledger-as-of').textContent = `Saldo hingga ${formatDate(end)}`;
+  document.querySelector('#dashboard-ledger-debit').textContent = formatMoney(trialBalance.debit);
+  document.querySelector('#dashboard-ledger-credit').textContent = formatMoney(trialBalance.credit);
+  document.querySelector('#dashboard-ledger-account-count').textContent = `${trialBalance.accountsWithBalance} akun memiliki saldo`;
+  const status = document.querySelector('#dashboard-ledger-status');
+  status.className = `balance-indicator ${balanced ? 'balanced' : 'unbalanced'}`;
+  status.textContent = balanced ? 'Seimbang' : 'Perlu ditinjau';
+}
+function renderJournal() {
+  const journals = matchingJournals(state.journalPeriod, state.journalType);
+  const blocks = journalBlocks(journals);
+  const rows = blocks.map((block) => {
+    const entries = journalBlockLines(block);
+    return entries.map(({ journal, journalIndex, lineIndex, line }, index) => {
+      const account = line.accounts || getAccount(line.account_code);
+      const credit = Number(line.credit || 0) > 0;
+      const startsSubjournal = block.isReversalGroup && journalIndex > 0 && lineIndex === 0;
+      const rowClasses = [credit ? 'journal-credit-row' : '', startsSubjournal ? 'journal-group-separator' : ''].filter(Boolean).join(' ');
+      const header = index === 0
+        ? `<td rowspan="${entries.length}">${escapeHtml(formatDate(journalDate(block.journals[0])))}</td><td rowspan="${entries.length}">${escapeHtml(journalEvidence(block.journals[0]))}</td><td rowspan="${entries.length}">${escapeHtml(journalTypeLabel(block.journals[0].journal_type))}</td><td rowspan="${entries.length}">${escapeHtml(journalBlockDescription(block))}<br><button type="button" class="text-button source-transaction-link" data-transaction-detail="${escapeHtml(block.journals[0].transaction_id || '')}">Lihat transaksi</button></td>`
+        : '';
+      return `<tr class="${rowClasses}">${header}<td>${escapeHtml(account.code)} · ${escapeHtml(account.name)}</td><td class="money-cell">${Number(line.debit || 0) ? formatMoney(line.debit) : '—'}</td><td class="money-cell">${Number(line.credit || 0) ? formatMoney(line.credit) : '—'}</td></tr>`;
+    }).join('');
+  }).join('');
+  const totals = journalTotals(journals);
+  const balanced = Math.abs(totals.debit - totals.credit) < 0.005;
+  document.querySelector('#journal-rows').innerHTML = rows;
+  document.querySelector('#journal-empty').hidden = journals.length > 0;
+  document.querySelector('#journal-totals').innerHTML = `<strong>Total debit: ${formatMoney(totals.debit)}</strong><strong>Total kredit: ${formatMoney(totals.credit)}</strong><span class="balance-indicator ${balanced ? 'balanced' : 'unbalanced'}">${balanced ? 'Seimbang' : 'Tidak seimbang'}</span>`;
+}
+function periodDateRange(period) {
+  if (isYearSelection(period)) return { start: `${period.slice(5)}-01-01`, end: `${period.slice(5)}-12-31` };
+  const [year, month] = period.split('-').map(Number);
+  return { start: `${period}-01`, end: periodEndDate(period) || `${year}-${String(month).padStart(2, '0')}-31` };
+}
+function movementFor(line, account) {
+  return account.normal_balance === 'credit'
+    ? Number(line.credit || 0) - Number(line.debit || 0)
+    : Number(line.debit || 0) - Number(line.credit || 0);
+}
+function accountMovements(account, throughDate = '9999-12-31') {
+  const total = { debit: 0, credit: 0, balance: 0 };
+  for (const journal of state.data.journals) {
+    if (journalDate(journal) > throughDate) continue;
+    for (const line of journalLines(journal).filter((item) => item.account_code === account.code)) {
+      total.debit += Number(line.debit || 0);
+      total.credit += Number(line.credit || 0);
+      total.balance += movementFor(line, account);
+    }
+  }
+  return total;
+}
+function ledgerEntriesForAccount(account, start, end) {
+  return state.data.journals
+    .filter((journal) => journalDate(journal) >= start && journalDate(journal) <= end)
+    .sort(compareJournalOrder)
+    .flatMap((journal) => journalLines(journal)
+      .filter((line) => line.account_code === account.code)
+      .map((line) => ({ journal, line })));
+}
+function renderLedger() {
+  const accountSelect = document.querySelector('#ledger-account-filter');
+  accountSelect.innerHTML = `<option value="all">Semua akun</option>${state.data.accounts.map((account) => `<option value="${escapeHtml(account.code)}">${escapeHtml(account.code)} · ${escapeHtml(account.name)}</option>`).join('')}`;
+  accountSelect.value = state.ledgerAccount;
+  const { start, end } = periodDateRange(state.ledgerPeriod);
+  const selectedAccounts = state.data.accounts.filter((account) => state.ledgerAccount === 'all' || account.code === state.ledgerAccount);
+  document.querySelector('#ledger-content').innerHTML = selectedAccounts.map((account) => {
+    const prior = accountMovements(account, new Date(new Date(`${start}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10)).balance;
+    const lines = ledgerEntriesForAccount(account, start, end);
+    let balance = prior;
+    const rows = lines.map(({ journal, line }) => {
+      balance += movementFor(line, account);
+      return `<tr><td>${escapeHtml(formatDate(journalDate(journal)))}</td><td><button type="button" class="text-button journal-number-link" data-transaction-detail="${escapeHtml(journal.transaction_id || '')}">${escapeHtml(journalEvidence(journal))}</button></td><td>${escapeHtml(journalTypeLabel(journal.journal_type))}</td><td>${escapeHtml(journal.description)}</td><td class="money-cell">${Number(line.debit || 0) ? formatMoney(line.debit) : '—'}</td><td class="money-cell">${Number(line.credit || 0) ? formatMoney(line.credit) : '—'}</td><td class="money-cell">${formatMoney(balance)}</td></tr>`;
+    }).join('');
+    return `<section class="panel ledger-account-panel"><div class="panel-heading"><div><p class="eyebrow">${escapeHtml(account.code)}</p><h2>${escapeHtml(account.name)}</h2></div><div class="ledger-balances"><span>Saldo akhir</span><strong>${formatMoney(balance)}</strong></div></div><div class="table-scroll"><table><thead><tr><th>TANGGAL</th><th>NO. SLIP</th><th>JENIS</th><th>KETERANGAN</th><th>DEBIT</th><th>KREDIT</th><th>SALDO</th></tr></thead><tbody>${rows || `<tr><td colspan="7" class="no-ledger-lines">Tidak ada mutasi pada periode ini.</td></tr>`}</tbody></table></div></section>`;
+  }).join('');
+  const trialRows = state.data.accounts.map((account) => {
+    const balance = accountMovements(account).balance;
+    const debitBalance = account.normal_balance === 'debit' ? balance : -balance;
+    return `<tr><td>${escapeHtml(account.code)}</td><td>${escapeHtml(account.name)}</td><td class="money-cell">${debitBalance > 0 ? formatMoney(debitBalance) : '—'}</td><td class="money-cell">${debitBalance < 0 ? formatMoney(-debitBalance) : '—'}</td></tr>`;
+  }).join('');
+  const trialTotals = state.data.accounts.reduce((total, account) => {
+    const balance = account.normal_balance === 'debit' ? accountMovements(account).balance : -accountMovements(account).balance;
+    total.debit += Math.max(0, balance);
+    total.credit += Math.max(0, -balance);
+    return total;
+  }, { debit: 0, credit: 0 });
+  const debit = trialTotals.debit;
+  const credit = trialTotals.credit;
+  document.querySelector('#trial-balance-panel').hidden = state.ledgerAccount !== 'all';
+  document.querySelector('#trial-balance-rows').innerHTML = trialRows;
+  document.querySelector('#trial-balance-totals').innerHTML = `<strong>Total debit: ${formatMoney(debit)}</strong><strong>Total kredit: ${formatMoney(credit)}</strong><span class="balance-indicator ${Math.abs(debit - credit) < 0.005 ? 'balanced' : 'unbalanced'}">${Math.abs(debit - credit) < 0.005 ? 'Seimbang' : 'Tidak seimbang'}</span>`;
+}
+function printReport(title, period, headers, rows, totals = '') {
+  const printWindow = window.open('', '_blank');
+  if (!printWindow) {
+    showToast('Jendela cetak diblokir browser. Izinkan pop-up lalu coba lagi.');
+    return;
+  }
+  const printedAt = new Intl.DateTimeFormat('id-ID', { dateStyle: 'long', timeStyle: 'short' }).format(new Date());
+  const themeToken = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const printTheme = {
+    ink: themeToken('--color-ink'),
+    primary: themeToken('--color-primary'),
+    primaryHover: themeToken('--color-primary-hover'),
+    muted: themeToken('--color-text-muted'),
+    line: themeToken('--color-line'),
+    mint: themeToken('--color-mint'),
+    surface: themeToken('--color-surface')
+  };
+  printWindow.document.write(`<!doctype html><html lang="id"><head><meta charset="utf-8"><title>${escapeHtml(title)} - Arboria</title><style>
+    :root{--print-ink:${printTheme.ink};--print-primary:${printTheme.primary};--print-primary-hover:${printTheme.primaryHover};--print-muted:${printTheme.muted};--print-line:${printTheme.line};--print-mint:${printTheme.mint};--print-surface:${printTheme.surface}}
+    @page{size:A4 landscape;margin:16mm 13mm 22mm}*{box-sizing:border-box}body{font:10px Arial,sans-serif;color:var(--print-ink);margin:0}header{border-bottom:2px solid var(--print-primary);padding-bottom:10px;margin-bottom:14px}h1{font-size:20px;margin:0 0 5px;color:var(--print-primary-hover)}header p{margin:3px 0;color:var(--print-muted)}table{width:100%;border-collapse:collapse;font-size:9px}th,td{border:1px solid var(--print-line);padding:6px;text-align:left}th{background:var(--print-primary);color:var(--print-surface)}.journal-credit-account{padding-left:22px;color:var(--print-muted)}.journal-group-separator td{border-top:1px solid var(--print-line)}tfoot{font-weight:bold}.totals{display:flex;justify-content:flex-end;gap:22px;margin-top:12px;font-size:11px;font-weight:bold}.signature{display:grid;grid-template-columns:1fr 1fr;gap:35%;margin-top:42px;text-align:center}.signature div{padding-top:55px;border-bottom:1px solid var(--print-muted)}.footer{margin-top:10px;font-size:9px;color:var(--print-muted)}.page-number:after{content:counter(page)}@media print{.footer{position:fixed;bottom:-13mm;left:0;right:0;display:flex;justify-content:space-between}}</style></head><body><header><h1>Perkebunan Arboria</h1><p>${escapeHtml(title)}</p><p>Periode: ${escapeHtml(period)}</p><p>Tanggal cetak: ${escapeHtml(printedAt)}</p></header><table><thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>${totals ? `<div class="totals">${totals}</div>` : ''}<div class="signature"><div>Dibuat oleh</div><div>Disetujui oleh</div></div><div class="footer"><span>Perkebunan Arboria &middot; ${escapeHtml(title)}</span><span>Halaman <b class="page-number"></b></span></div><script>window.onload=()=>window.print();</script></body></html>`);
+  printWindow.document.close();
+}
+function showToast(message) {
+  const toast = document.querySelector('#toast');
+  toast.textContent = message;
+  toast.classList.add('visible');
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => toast.classList.remove('visible'), 3200);
+}
+function switchView(viewName) {
+  document.querySelectorAll('.view').forEach((view) => view.classList.toggle('active', view.id === `${viewName}-view`));
+  document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.view === viewName));
+  document.querySelector('#breadcrumb-label').textContent = { dashboard: 'Dashboard', employees: 'Data karyawan', attendance: 'Absensi', payroll: 'Penggajian dan Pengupahan', journal: 'Jurnal Umum', ledger: 'Buku Besar' }[viewName] || 'Dashboard';
+  if (viewName === 'payroll') renderPayroll();
+  if (viewName === 'employees') renderEmployees();
+  if (viewName === 'attendance') renderAttendance();
+}
+function fieldMarkup(label, name, { type = 'text', required = true, value = '', placeholder = '', min = '', step = '', full = false, options = null, hint = '', readonly = false, containerId = '' } = {}) {
+  const className = full ? 'form-field full' : 'form-field';
+  const attr = `${required ? 'required' : ''} ${min !== '' ? `min="${min}"` : ''} ${step ? `step="${step}"` : ''} ${placeholder ? `placeholder="${escapeHtml(placeholder)}"` : ''} ${readonly ? 'readonly' : ''}`;
+  const control = options ? `<select id="field-${name}" name="${name}" ${required ? 'required' : ''}>${options.map((option) => `<option value="${escapeHtml(option.value)}" ${option.selected ? 'selected' : ''}>${escapeHtml(option.label)}</option>`).join('')}</select>` : `<input id="field-${name}" name="${name}" type="${type}" value="${escapeHtml(value)}" ${attr}>`;
+  return `<div${containerId ? ` id="${escapeHtml(containerId)}"` : ''} class="${className}"><label for="field-${name}">${label}</label>${control}${hint ? `<span class="form-help">${hint}</span>` : ''}</div>`;
+}
+function openModal(kind, existing = null) {
+  const backdrop = document.querySelector('#modal-backdrop');
+  const title = document.querySelector('#modal-title');
+  const eyebrow = document.querySelector('#modal-eyebrow');
+  const form = document.querySelector('#modal-form');
+  form.oninput = null;
+  if (kind === 'cancel') {
+    eyebrow.textContent = 'BATAL TRANSAKSI';
+    title.textContent = 'Batalkan transaksi';
+    form.innerHTML = `<div class="form-grid"><p class="form-help full">Transaksi ${escapeHtml(existing?.kind === 'salary' ? 'gaji' : 'upah')} ${escapeHtml(employeeFor(existing || {}).full_name)} akan dikunci dengan status Dibatalkan. Sistem membuat jurnal pembalik untuk seluruh jurnal terkait.</p>${fieldMarkup('Alasan pembatalan', 'reason', { type: 'text', full: true, placeholder: 'Wajib diisi' })}<div class="form-error" id="form-error"></div><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Kembali</button><button type="submit" class="button button-primary">Batalkan transaksi</button></div></div>`;
+  } else if (kind === 'correction') {
+    const baseline = correctionBaseline(existing);
+    const isSalary = existing.kind === 'salary';
+    const correctionUnit = existing.unit || harvestBlockFor(existing.block_code || employeeFor(existing).division).unit || 'satuan';
+    eyebrow.textContent = 'KOREKSI NOMINAL';
+    title.textContent = `Koreksi ${isSalary ? 'gaji staf' : 'upah panen'}`;
+    const correctionFields = isSalary
+      ? `${fieldMarkup('Gaji pokok yang benar (Rp)', 'basic_salary', { type: 'number', min: '0', step: '0.01', value: baseline.basic_salary })}${fieldMarkup('Tunjangan yang benar (Rp)', 'allowances', { type: 'number', min: '0', step: '0.01', value: baseline.allowances })}${fieldMarkup('Potongan yang benar (Rp)', 'deductions', { type: 'number', min: '0', step: '0.01', value: baseline.deductions })}`
+      : `${fieldMarkup(`Jumlah panen yang benar (${correctionUnit})`, 'weight_kg', { type: 'number', min: '0.01', step: '0.01', value: baseline.weight_kg })}${fieldMarkup(`Tarif per ${correctionUnit} yang benar (Rp)`, 'rate_per_kg', { type: 'number', min: '0', step: '0.01', value: baseline.rate_per_kg })}`;
+    form.innerHTML = `<div class="form-grid"><p class="form-help full">Isi nilai yang benar. Sistem mencatat jurnal hanya sebesar selisih. Jika belum dibayar, koreksi akan digabung ke pembayaran dan slip asli; jika sudah dibayar, selisih positif dibayar dengan slip tambahan.</p>${correctionFields}<div id="correction-preview" class="form-help full"></div>${fieldMarkup('Alasan koreksi', 'reason', { full: true, placeholder: 'Wajib diisi' })}<div class="form-error" id="form-error"></div><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Kembali</button><button type="submit" class="button button-primary">Simpan koreksi</button></div></div>`;
+    const updatePreview = () => {
+      const value = (name) => Number(form.querySelector(`[name="${name}"]`)?.value || 0);
+      let deltas;
+      let netDelta;
+      if (isSalary) {
+        deltas = [
+          ['Selisih gaji pokok', value('basic_salary') - baseline.basic_salary],
+          ['Selisih tunjangan', value('allowances') - baseline.allowances],
+          ['Selisih potongan', value('deductions') - baseline.deductions]
+        ];
+        netDelta = deltas[0][1] + deltas[1][1] - deltas[2][1];
+      } else {
+        deltas = [['Selisih upah panen', roundAmount(value('weight_kg') * value('rate_per_kg') - baseline.weight_kg * baseline.rate_per_kg)]];
+        netDelta = deltas[0][1];
+      }
+      const label = existing.status === 'paid' && netDelta < 0
+        ? `Kelebihan bayar ${formatMoney(Math.abs(netDelta))}`
+        : existing.status === 'paid' && netDelta > 0
+          ? 'Tambahan utang akan menunggu pembayaran'
+          : `Selisih bersih ${formatSignedMoney(netDelta)}`;
+      form.querySelector('#correction-preview').innerHTML = `<strong>Pratinjau selisih</strong><br>${deltas.map(([name, amount]) => `${name}: ${formatSignedMoney(amount)}`).join('<br>')}<br><strong>${escapeHtml(label)}</strong>`;
+    };
+    form.oninput = updatePreview;
+    updatePreview();
+  } else if (kind === 'transaction-detail') {
+    eyebrow.textContent = 'RIWAYAT AKTIVITAS';
+    title.textContent = 'Detail transaksi';
+    const audit = state.data.auditTrail.filter((item) => item.transaction_id === existing?.id);
+    const events = audit.map((item) => `<li><strong>${escapeHtml(item.action.toUpperCase())} · ${escapeHtml(item.actor || 'Admin Arboria')}</strong><small>${escapeHtml(new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(item.occurred_at)))}</small>${item.reason ? `<small class="audit-reason">Alasan: ${escapeHtml(item.reason)}</small>` : ''}${item.slip_number ? `<small>No. slip: ${escapeHtml(item.slip_number)}</small>` : ''}</li>`).join('');
+    const source = existing?.is_correction
+      ? [...state.data.salaries, ...state.data.harvests].find((item) => item.id === existing.original_transaction_id)
+      : existing;
+    const corrections = source
+      ? state.data.corrections.filter((item) => item.original_transaction_id === source.id)
+      : [];
+    const finalValues = source ? correctionBaseline(source) : null;
+    const isSalary = existing?.kind === 'salary';
+    const originalValues = source || existing;
+    const employeeHomeBlock = employeeFor(source || existing || {}).division;
+    const harvestBlockCode = originalValues?.block_code || employeeHomeBlock || '—';
+    const harvestBlock = harvestBlockFor(harvestBlockCode);
+    const harvestCommodity = originalValues?.commodity || harvestBlock.commodity || 'Belum diatur';
+    const harvestUnit = originalValues?.unit || harvestBlock.unit || 'Belum diatur';
+    const harvestUnitLabel = harvestUnit === 'Belum diatur' ? 'satuan' : harvestUnit;
+    const valueRows = isSalary
+      ? [
+          ['Gaji pokok', formatMoney(originalValues?.basic_salary || 0), formatMoney(finalValues?.basic_salary ?? originalValues?.basic_salary ?? 0)],
+          ['Tunjangan', formatMoney(originalValues?.allowances || 0), formatMoney(finalValues?.allowances ?? originalValues?.allowances ?? 0)],
+          ['Potongan', formatMoney(originalValues?.deductions || 0), formatMoney(finalValues?.deductions ?? originalValues?.deductions ?? 0)]
+        ]
+      : [
+          ['Blok panen', harvestBlockCode, harvestBlockCode],
+          ['Komoditas', harvestCommodity, harvestCommodity],
+          ['Jumlah panen', `${number.format(originalValues?.weight_kg || 0)} ${harvestUnit}`, `${number.format(finalValues?.weight_kg ?? originalValues?.weight_kg ?? 0)} ${harvestUnit}`],
+          [`Tarif per ${harvestUnitLabel}`, formatMoney(originalValues?.rate_per_kg || 0), formatMoney(finalValues?.rate_per_kg ?? originalValues?.rate_per_kg ?? 0)]
+        ];
+    const blockMovementNote = !isSalary && harvestBlockCode !== employeeHomeBlock && employeeHomeBlock
+      ? `<p class="form-help full"><span class="block-transfer-label">Dipindah dari ${escapeHtml(employeeHomeBlock)}</span></p>`
+      : '';
+    const correctionNote = corrections.map((item) =>
+      `${item.slip_number || 'Tanpa slip tersendiri'} (${item.status === 'overpaid'
+        ? `kelebihan bayar ${formatMoney(Math.abs(Number(item.net_amount || 0)))}`
+        : item.reason || 'koreksi'})`).join(', ');
+    const correctionHistory = corrections.map((item) => {
+      const changes = isSalary
+        ? `Pokok ${formatSignedMoney(item.delta_basic_salary)} · Tunjangan ${formatSignedMoney(item.delta_allowances)} · Potongan ${formatSignedMoney(item.delta_deductions)}`
+        : `Upah ${formatSignedMoney(item.delta_gross)}`;
+      const evidence = item.slip_number || (item.paid_with_original ? source?.slip_number : null) || '—';
+      return `<tr><td>${escapeHtml(formatDate(item.correction_date))}</td><td>${escapeHtml(item.reason || '—')}</td><td>${escapeHtml(changes)}</td><td>${escapeHtml(evidence)}</td><td>${formatSignedMoney(item.net_amount)}</td></tr>`;
+    }).join('');
+    const valueSummary = `<section class="full"><h3>Nilai transaksi</h3><div class="table-scroll"><table><thead><tr><th>KOMPONEN</th><th>ASLI</th><th>NILAI AKHIR</th></tr></thead><tbody>${valueRows.map(([label, originalValue, finalValue]) => `<tr><td>${label}</td><td>${originalValue}</td><td>${finalValue}</td></tr>`).join('')}</tbody></table></div>${corrections.length ? `<h3>Riwayat koreksi</h3><div class="table-scroll"><table><thead><tr><th>TANGGAL</th><th>ALASAN</th><th>RINCIAN SELISIH</th><th>NO. SLIP</th><th>SELISIH BERSIH</th></tr></thead><tbody>${correctionHistory}</tbody></table></div>` : ''}</section>`;
+    const dicatatOleh = audit.find((item) => item.action === 'dicatat')?.actor || '—';
+    const dikoreksiOleh = audit.find((item) => item.action === 'dikoreksi')?.actor || '—';
+    const dibatalkanOleh = audit.find((item) => item.action === 'dibatalkan')?.actor || '—';
+    form.innerHTML = `<div class="form-grid"><p class="form-help full">${escapeHtml(employeeFor(existing || {}).full_name)} · ${escapeHtml(existing?.kind === 'salary' ? 'Gaji staf' : 'Upah panen')} · ${escapeHtml(monthLabel(periodFor(existing || {})))}</p><p class="form-help full">Nomor slip: <strong>${escapeHtml(existing?.slip_number || '—')}</strong>${existing?.is_correction && source ? ` · Koreksi atas ${escapeHtml(source.slip_number || '—')}` : ''}</p>${correctionNote ? `<p class="form-help full">Riwayat koreksi: ${escapeHtml(correctionNote)}</p>` : ''}${blockMovementNote}${valueSummary}<p class="form-help full">Dicatat oleh: ${escapeHtml(dicatatOleh)} · Dikoreksi oleh: ${escapeHtml(dikoreksiOleh)} · Dibatalkan oleh: ${escapeHtml(dibatalkanOleh)}</p><ul class="audit-list full">${events || '<li>Riwayat transaksi belum tersedia.</li>'}</ul><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button>${!existing?.is_correction && existing?.status !== 'cancelled' ? `<button type="button" class="button button-secondary" data-correct-detail="${escapeHtml(existing.id)}">Koreksi</button><button type="button" class="button button-primary" data-cancel-detail="${escapeHtml(existing.id)}">Batal</button>` : ''}</div></div>`;
+  } else if (kind === 'attendance-detail') {
+    eyebrow.textContent = isYearSelection(existing.period) ? 'DETAIL ABSENSI TAHUNAN' : 'DETAIL ABSENSI BULANAN';
+    title.textContent = `${existing.employee.full_name} · ${selectionLabel(existing.period)}`;
+    const entries = state.data.dailyAttendance.filter((item) => item.employee_id === existing.employee.id && reportPeriodMatches(item.attendance_date, existing.period))
+      .sort((left, right) => left.attendance_date.localeCompare(right.attendance_date));
+    const label = { present: 'Hadir', leave: 'Izin', absent: 'Alfa' };
+    const legacyRows = state.data.attendance.filter((item) => item.employee_id === existing.employee.id
+      && reportPeriodMatches(item.period_id, existing.period)
+      && !state.data.dailyAttendance.some((daily) => daily.employee_id === item.employee_id && daily.attendance_date.slice(0, 7) === item.period_id))
+      .map((legacy) => {
+        const monthPrefix = isYearSelection(existing.period) ? `${monthLabel(legacy.period_id)} · ` : '';
+        return `<tr><td>${escapeHtml(monthPrefix)}Hari hadir (rekap historis)</td><td>${Number(legacy.working_days)}</td></tr><tr><td>${escapeHtml(monthPrefix)}Izin (rekap historis)</td><td>${Number(legacy.leave_days)}</td></tr><tr><td>${escapeHtml(monthPrefix)}Alfa (rekap historis)</td><td>${Number(legacy.absent_days)}</td></tr>`;
+      }).join('');
+    form.innerHTML = `<div class="table-scroll"><table><thead><tr><th>TANGGAL / KETERANGAN</th><th>STATUS / JUMLAH</th></tr></thead><tbody>${entries.map((entry) => `<tr><td>${escapeHtml(formatDate(entry.attendance_date))}</td><td><span class="attendance-status ${entry.status}">${label[entry.status]}</span></td></tr>`).join('')}${legacyRows}</tbody></table></div><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>`;
+  } else if (kind === 'journal-detail') {
+    eyebrow.textContent = 'DETAIL JURNAL';
+    title.textContent = journalEvidence(existing);
+    const lines = journalLines(existing).map((line) => {
+      const credit = Number(line.credit || 0) > 0;
+      return `<tr class="${credit ? 'journal-credit-row' : ''}"><td>${escapeHtml(line.account_code)} · ${escapeHtml((line.accounts || getAccount(line.account_code)).name)}</td><td>${Number(line.debit) ? formatMoney(line.debit) : '—'}</td><td>${Number(line.credit) ? formatMoney(line.credit) : '—'}</td></tr>`;
+    }).join('');
+    form.innerHTML = `<div class="form-grid"><p class="form-help full">${escapeHtml(formatDate(journalDate(existing)))} · ${escapeHtml(existing.description)}</p><table class="full"><thead><tr><th>AKUN</th><th>DEBIT</th><th>KREDIT</th></tr></thead><tbody>${lines}</tbody></table><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div></div>`;
+  } else if (kind === 'employee') {
+    eyebrow.textContent = 'DATA TENAGA KERJA';
+    title.textContent = existing ? 'Edit karyawan' : 'Tambah karyawan';
+    const initialEmployeeCode = existing?.employee_code || 'STF-';
+    const employeeBlockOptions = (selectedDivision, preserveLegacyDivision = false) => {
+      const selectedBlock = HARVEST_BLOCK_DETAILS.find((block) => block.code === selectedDivision
+        || `${block.code} - ${block.commodity}` === selectedDivision);
+      if (!selectedBlock && preserveLegacyDivision && selectedDivision) {
+        return [
+          { value: selectedDivision, label: selectedDivision, selected: true },
+          ...HARVEST_BLOCK_DETAILS.map((block) => ({ value: block.code, label: `${block.code} - ${block.commodity}` }))
+        ];
+      }
+      const selectedCode = selectedBlock?.code || HARVEST_BLOCK_DETAILS[0].code;
+      return HARVEST_BLOCK_DETAILS.map((block) => ({
+        value: block.code,
+        label: `${block.code} - ${block.commodity}`,
+        selected: block.code === selectedCode
+      }));
+    };
+    const divisionField = (employmentType, division, preserveLegacyDivision = false) => fieldMarkup(
+      'Divisi / blok kebun',
+      'division',
+      employmentType === 'harvester'
+        ? { options: employeeBlockOptions(division, preserveLegacyDivision), containerId: 'division-field' }
+        : { value: division, placeholder: 'Contoh: Administrasi', containerId: 'division-field' }
+    );
+    const initialEmploymentType = existing?.employment_type || 'staff';
+    const initialDivision = existing?.division || '';
+    form.innerHTML = `<div class="form-grid">${fieldMarkup('Nama lengkap', 'full_name', { value: existing?.full_name || '', placeholder: 'Contoh: Siti Rahmawati' })}${fieldMarkup('ID karyawan', 'employee_code', { value: initialEmployeeCode, placeholder: 'Contoh: STF-004' })}${fieldMarkup('Jenis tenaga kerja', 'employment_type', { options: [{ value: 'staff', label: 'Staf bergaji bulanan', selected: initialEmploymentType === 'staff' }, { value: 'harvester', label: 'Pemanen lapangan', selected: initialEmploymentType === 'harvester' }] })}${divisionField(initialEmploymentType, initialDivision, initialEmploymentType === 'harvester') }<div class="form-field full" id="salary-field">${fieldMarkup('Gaji pokok bulanan (Rp)', 'monthly_salary', { type: 'number', min: '0', step: '1000', value: initialEmploymentType === 'harvester' ? 0 : existing?.monthly_salary ?? '5000000', full: true })}</div><div class="form-error" id="form-error"></div><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary">${existing ? 'Simpan perubahan' : 'Simpan karyawan'}</button></div></div>`;
+    const updateEmployeeTypeFields = (employmentType, preserveLegacyDivision = false) => {
+      const divisionInput = form.querySelector('[name="division"]');
+      const division = divisionInput?.value || initialDivision;
+      form.querySelector('#division-field').outerHTML = divisionField(employmentType, division, preserveLegacyDivision);
+      const isStaff = employmentType === 'staff';
+      form.querySelector('#salary-field').hidden = !isStaff;
+      if (!isStaff) form.querySelector('[name="monthly_salary"]').value = '0';
+      const codeInput = form.querySelector('[name="employee_code"]');
+      const prefix = isStaff ? 'STF-' : 'PNN-';
+      codeInput.value = prefix + codeInput.value.replace(/^(STF-|PNN-)/, '');
+    };
+    form.querySelector('[name="employment_type"]').addEventListener('change', (event) => {
+      updateEmployeeTypeFields(event.target.value);
+    });
+    updateEmployeeTypeFields(initialEmploymentType, initialEmploymentType === 'harvester');
+  } else if (kind === 'attendance') {
+    const editing = Boolean(existing);
+    eyebrow.textContent = 'KEHADIRAN TENAGA KERJA';
+    title.textContent = editing ? 'Edit absensi' : 'Catat absensi';
+    const employees = state.data.employees.filter((employee) => !employee.archived_at || employee.id === existing?.employee_id).map((employee) => ({
+      value: employee.id,
+      label: `${employee.full_name} · ${employee.employee_code}`,
+      selected: employee.id === existing?.employee_id
+    }));
+    const period = existing?.period_id || currentPeriod();
+    const employeeField = employees.length
+      ? fieldMarkup('Karyawan', 'employee_id', { options: employees, full: true })
+      : '<div class="form-field full"><span class="form-help">Belum ada karyawan. Tambahkan karyawan terlebih dahulu.</span></div>';
+    form.innerHTML = `<div class="form-grid">${employeeField}${fieldMarkup('Periode', 'period', { type: 'month', value: period })}${fieldMarkup('Hari kerja', 'working_days', { type: 'number', min: '0', step: '1', value: existing?.working_days ?? '22' })}${fieldMarkup('Izin', 'leave_days', { type: 'number', min: '0', step: '1', value: existing?.leave_days ?? '0' })}${fieldMarkup('Alfa', 'absent_days', { type: 'number', min: '0', step: '1', value: existing?.absent_days ?? '0' })}<div class="form-error" id="form-error"></div><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary">${editing ? 'Simpan perubahan' : 'Simpan absensi'}</button></div></div>`;
+  } else {
+    const isSalary = kind === 'salary';
+    const editing = Boolean(existing);
+    const people = state.data.employees.filter((employee) => !employee.archived_at && employee.employment_type === (isSalary ? 'staff' : 'harvester'));
+    eyebrow.textContent = isSalary ? 'GAJI BULANAN TETAP' : 'UPAH BERDASARKAN HASIL PANEN';
+    title.textContent = editing ? `Edit ${isSalary ? 'gaji staf' : 'hasil panen'}` : isSalary ? 'Catat gaji staf' : 'Catat hasil panen';
+    const employeeOptions = people.map((employee) => ({ value: employee.id, label: `${employee.full_name} · ${employee.employee_code}`, selected: employee.id === existing?.employee_id }));
+    const defaultPeriod = isYearSelection(state.selectedPeriod) ? `${state.selectedPeriod.slice(5)}-01` : state.selectedPeriod || currentPeriod();
+    const period = existing ? periodFor(existing) : defaultPeriod;
+    const employeeField = employeeOptions.length ? fieldMarkup('Karyawan', 'employee_id', { options: employeeOptions, full: true }) : '<div class="form-field full"><span class="form-help">Belum ada karyawan untuk skema ini. Tambahkan karyawan terlebih dahulu.</span></div>';
+    const employeeBlockCode = people.find((employee) => employee.id === existing?.employee_id)?.division || people[0]?.division;
+    const initialBlockCode = (existing?.block_code && state.data.harvestBlocks.some((block) => block.code === existing.block_code)
+      ? existing.block_code
+      : state.data.harvestBlocks.some((block) => block.code === employeeBlockCode) ? employeeBlockCode : state.data.harvestBlocks[0]?.code)
+      || '';
+    const blockOptions = isSalary ? [] : state.data.harvestBlocks.map((block) => ({
+      value: block.code,
+      label: `${block.code} - ${harvestBlockFor(block.code).commodity || 'Komoditas belum diatur'}`,
+      selected: block.code === initialBlockCode
+    }));
+    const detailFields = isSalary
+      ? `${fieldMarkup('Tanggal gaji', 'payment_date', { type: 'date', value: existing?.payment_date || periodEndDate(period), hint: 'Default: hari terakhir periode gaji.' })}${fieldMarkup('Gaji pokok (Rp)', 'basic_salary', { type: 'number', min: '0', step: '1000', value: existing?.basic_salary ?? people[0]?.monthly_salary ?? '0' })}${fieldMarkup('Tunjangan (Rp)', 'allowances', { type: 'number', min: '0', step: '1000', value: existing?.allowances ?? '0' })}${fieldMarkup('Potongan (Rp)', 'deductions', { type: 'number', min: '0', step: '1000', value: existing?.deductions ?? '0' })}`
+      : `${fieldMarkup('Blok panen', 'block_code', { options: blockOptions, full: true })}${fieldMarkup('Komoditas', 'commodity_display', { required: false, value: harvestBlockFor(initialBlockCode).commodity || 'Belum diatur', readonly: true })}${fieldMarkup(`Jumlah panen (${harvestBlockFor(initialBlockCode).unit || 'satuan'})`, 'weight_kg', { type: 'number', min: '0.1', step: '0.1', value: existing?.weight_kg ?? '', placeholder: 'Masukkan jumlah panen' })}${fieldMarkup(`Tarif per ${harvestBlockFor(initialBlockCode).unit || 'satuan'} (Rp)`, 'rate_per_kg', { type: 'number', min: '0', step: 'any', value: existing?.rate_per_kg ?? harvestBlockFor(initialBlockCode).standard_rate ?? '', hint: harvestBlockFor(initialBlockCode).standard_rate == null ? 'Tarif standar blok belum diatur; isi tarif untuk transaksi ini.' : 'Tarif standar blok dapat diubah.' })}${fieldMarkup('Tanggal panen', 'harvest_date', { type: 'date', value: existing?.harvest_date || dateForPeriod(period) })}`;
+    const total = isSalary ? '<span class="form-total full"><span>Gaji bersih diterima</span><strong id="computed-total">Rp0</strong></span>' : '<span class="form-total full"><span>Perkiraan upah panen</span><strong id="computed-total">Rp0</strong></span>';
+    form.innerHTML = `<div class="form-grid">${employeeField}${fieldMarkup('Periode', 'period', { type: 'month', value: period })}${detailFields}${total}${fieldMarkup('Status', 'status', { options: [{ value: 'pending', label: 'Menunggu pembayaran', selected: existing?.status !== 'paid' }, { value: 'paid', label: 'Dibayar', selected: existing?.status === 'paid' }], full: true })}<div class="form-error" id="form-error"></div><div class="form-actions full"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary">${editing ? 'Simpan perubahan' : 'Simpan transaksi'}</button></div></div>`;
+    form.querySelector('[name="period"]').addEventListener('change', (event) => {
+      if (isSalary) {
+        form.querySelector('[name="payment_date"]').value = periodEndDate(event.target.value);
+      } else {
+        const harvestDate = form.querySelector('[name="harvest_date"]');
+        harvestDate.value = dateForPeriod(event.target.value, Number(harvestDate.value.slice(-2)) || new Date().getDate());
+      }
+    });
+    const updateTotal = () => {
+      const value = (name) => Number(form.querySelector(`[name="${name}"]`)?.value || 0);
+      const amount = isSalary ? value('basic_salary') + value('allowances') - value('deductions') : value('weight_kg') * value('rate_per_kg');
+      form.querySelector('#computed-total').textContent = formatMoney(Math.max(0, amount));
+    };
+    if (isSalary) {
+      form.querySelector('[name="employee_id"]').addEventListener('change', (event) => {
+        const selectedEmployee = people.find((employee) => employee.id === event.target.value);
+        if (selectedEmployee) {
+          form.querySelector('[name="basic_salary"]').value = String(Number(selectedEmployee.monthly_salary) || 0);
+        }
+        updateTotal();
+      });
+    } else {
+      const updateBlockFields = (blockCode, applyStandardRate) => {
+        const block = harvestBlockFor(blockCode);
+        const unit = block.unit || 'satuan';
+        form.querySelector('[name="commodity_display"]').value = block.commodity || 'Belum diatur';
+        form.querySelector('label[for="field-weight_kg"]').textContent = `Jumlah panen (${unit})`;
+        form.querySelector('label[for="field-rate_per_kg"]').textContent = `Tarif per ${unit} (Rp)`;
+        form.querySelector('[name="rate_per_kg"]').closest('.form-field').querySelector('.form-help').textContent =
+          block.standard_rate == null ? 'Tarif standar blok belum diatur; isi tarif untuk transaksi ini.' : 'Tarif standar blok dapat diubah.';
+        if (applyStandardRate) form.querySelector('[name="rate_per_kg"]').value = block.standard_rate == null ? '' : String(block.standard_rate);
+      };
+      form.querySelector('[name="block_code"]').addEventListener('change', (event) => {
+        updateBlockFields(event.target.value, true);
+        updateTotal();
+      });
+      form.querySelector('[name="employee_id"]').addEventListener('change', (event) => {
+        if (existing) return;
+        const employee = people.find((item) => item.id === event.target.value);
+        const blockOption = [...form.querySelector('[name="block_code"]').options].find((item) => item.value === employee?.division);
+        if (blockOption) {
+          form.querySelector('[name="block_code"]').value = employee.division;
+          updateBlockFields(employee.division, true);
+          updateTotal();
+        }
+      });
+    }
+    form.oninput = updateTotal;
+    updateTotal();
+  }
+  form.dataset.kind = kind;
+  form.dataset.recordId = existing?.id || '';
+  form.dataset.recordKind = existing?.kind || '';
+  backdrop.hidden = false;
+  document.body.style.overflow = 'hidden';
+  form.querySelector('input, select')?.focus();
+}
+function closeModal() {
+  document.querySelector('#modal-backdrop').hidden = true;
+  document.body.style.overflow = '';
+}
+async function submitForm(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const kind = form.dataset.kind;
+  const formData = Object.fromEntries(new FormData(form).entries());
+  const errorNode = form.querySelector('#form-error');
+  errorNode.textContent = '';
+  const submitButton = form.querySelector('[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    if (kind === 'correction') {
+      const source = transactions().find((item) => item.id === form.dataset.recordId && !item.is_correction);
+      if (!source || source.status === 'cancelled') throw new Error('Transaksi tidak ditemukan atau sudah dibatalkan.');
+      const reason = String(formData.reason || '').trim();
+      if (!reason) throw new Error('Alasan koreksi wajib diisi.');
+      const isSalary = source.kind === 'salary';
+      const values = isSalary
+        ? {
+            basic_salary: Number(formData.basic_salary),
+            allowances: Number(formData.allowances),
+            deductions: Number(formData.deductions)
+          }
+        : { weight_kg: Number(formData.weight_kg), rate_per_kg: Number(formData.rate_per_kg) };
+      if (Object.values(values).some((value) => !Number.isFinite(value) || value < 0)
+        || (!isSalary && values.weight_kg <= 0)) {
+        throw new Error('Nilai koreksi harus berupa angka yang valid dan tidak negatif.');
+      }
+      const baseline = correctionBaseline(source);
+      const deltaBasic = isSalary ? values.basic_salary - baseline.basic_salary : 0;
+      const deltaAllowances = isSalary ? values.allowances - baseline.allowances : 0;
+      const deltaDeductions = isSalary ? values.deductions - baseline.deductions : 0;
+      const deltaGross = isSalary ? 0 : roundAmount(values.weight_kg * values.rate_per_kg - baseline.weight_kg * baseline.rate_per_kg);
+      const netAmount = isSalary ? deltaBasic + deltaAllowances - deltaDeductions : deltaGross;
+      const hasChange = isSalary
+        ? deltaBasic !== 0 || deltaAllowances !== 0 || deltaDeductions !== 0
+        : deltaGross !== 0;
+      if (!hasChange) throw new Error('Tidak ada perubahan nilai untuk dikoreksi.');
+      if (isSalary && values.deductions > values.basic_salary + values.allowances) {
+        throw new Error('Potongan tidak boleh melebihi gaji pokok dan tunjangan.');
+      }
+      const resultingAmount = isSalary
+        ? values.basic_salary + values.allowances - values.deductions
+        : values.weight_kg * values.rate_per_kg;
+      if (source.status === 'pending' && resultingAmount < 0) {
+        throw new Error('Jumlah bersih setelah koreksi tidak boleh kurang dari nol.');
+      }
+      if (state.demo) {
+        const now = new Date().toISOString();
+        const correction = {
+          id: `demo-${crypto.randomUUID()}`,
+          transaction_kind: source.kind,
+          original_transaction_id: source.id,
+          employee_id: source.employee_id,
+          period_id: source.period_id,
+          correction_date: now.slice(0, 10),
+          correction_values: values,
+          delta_basic_salary: deltaBasic,
+          delta_allowances: deltaAllowances,
+          delta_deductions: deltaDeductions,
+          delta_gross: deltaGross,
+          net_amount: netAmount,
+          reason,
+          status: source.status === 'pending' ? 'pending' : netAmount > 0 ? 'pending' : netAmount < 0 ? 'overpaid' : 'paid',
+          paid_at: source.status === 'paid' && netAmount === 0 ? now : null,
+          paid_with_original: false,
+          created_at: now,
+          employees: employeeFor(source)
+        };
+        state.data.corrections.unshift(correction);
+        state.data.auditTrail.push(
+          { transaction_id: source.id, transaction_kind: source.kind, action: 'dikoreksi', actor: 'Admin Arboria', reason, slip_number: null, occurred_at: now },
+          { transaction_id: correction.id, transaction_kind: source.kind, action: 'dicatat', actor: 'Admin Arboria', reason, slip_number: null, occurred_at: now }
+        );
+        if (correction.status === 'overpaid') {
+          state.data.auditTrail.push({ transaction_id: correction.id, transaction_kind: source.kind, action: 'dikoreksi', actor: 'Admin Arboria', reason: `Kelebihan bayar ${formatMoney(Math.abs(netAmount))}`, slip_number: null, occurred_at: now });
+        } else if (correction.status === 'paid') {
+          state.data.auditTrail.push({ transaction_id: correction.id, transaction_kind: source.kind, action: 'dibayar', actor: 'Admin Arboria', slip_number: null, occurred_at: now });
+        }
+        state.data.journals = buildDemoJournals(state.data);
+        persistDemo();
+      } else if (backendApiBase() === null) {
+        await supabaseRequest('rpc/correct_payroll_transaction', '', 'POST', {
+          transaction_type: source.kind,
+          transaction_key: source.id,
+          correction_values: values,
+          reason
+        });
+        await loadData();
+      } else {
+        await postJson(`/api/${isSalary ? 'salaries' : 'harvests'}/${encodeURIComponent(source.id)}/correct`, { values, reason });
+        await loadData();
+      }
+      state.selectedPeriod = periodFor(source);
+      render();
+      closeModal();
+      showToast(source.status === 'pending'
+        ? 'Koreksi disimpan; pembayaran akan memakai nilai akhir pada satu slip.'
+        : 'Koreksi dan jurnal selisih berhasil disimpan.');
+      return;
+    }
+    if (kind === 'cancel') {
+      const displayedEntry = transactions().find((item) => item.id === form.dataset.recordId);
+      if (!displayedEntry || displayedEntry.is_correction || displayedEntry.status === 'cancelled') throw new Error('Transaksi tidak ditemukan atau sudah dibatalkan.');
+      const sourceEntries = displayedEntry.kind === 'salary' ? state.data.salaries : state.data.harvests;
+      const sourceEntry = sourceEntries.find((item) => item.id === displayedEntry.id);
+      if (!sourceEntry) throw new Error('Transaksi tidak ditemukan.');
+      const entry = { ...displayedEntry };
+      const reason = String(formData.reason || '').trim();
+      if (!reason) throw new Error('Alasan pembatalan wajib diisi.');
+      if (state.demo) {
+        Object.assign(sourceEntry, { cancelled_at: new Date().toISOString(), status: 'cancelled', cancellation_reason: reason, cancelled_by: 'Admin Arboria' });
+        Object.assign(entry, sourceEntry);
+        state.data.auditTrail.push({
+          transaction_id: entry.id, transaction_kind: entry.kind, action: 'dibatalkan',
+          actor: 'Admin Arboria', reason, slip_number: entry.slip_number, occurred_at: new Date().toISOString()
+        });
+        for (const correction of state.data.corrections.filter((item) => item.original_transaction_id === entry.id && item.status !== 'cancelled')) {
+          correction.status = 'cancelled';
+          state.data.auditTrail.push({
+            transaction_id: correction.id, transaction_kind: entry.kind, action: 'dibatalkan',
+            actor: 'Admin Arboria', reason, slip_number: correction.slip_number, occurred_at: new Date().toISOString()
+          });
+        }
+        state.data.journals = buildDemoJournals(state.data);
+        persistDemo();
+      } else {
+        const pluralKind = entry.kind === 'salary' ? 'salaries' : 'harvests';
+        if (backendApiBase() === null) {
+          await supabaseRequest('rpc/cancel_payroll_transaction', '', 'POST', {
+            transaction_type: entry.kind,
+            transaction_key: entry.id,
+            reason
+          });
+        } else {
+          const response = await fetch(apiUrl(`/api/${pluralKind}/${encodeURIComponent(entry.id)}/cancel`), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason })
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || 'Pembatalan transaksi gagal.');
+        }
+        await loadData();
+      }
+      render();
+      closeModal();
+      showToast('Transaksi dibatalkan dan jurnal pembalik berhasil dibuat.');
+      return;
+    }
+    if (kind === 'attendance') {
+      const payload = {
+        employee_id: formData.employee_id,
+        period: formData.period,
+        working_days: Number(formData.working_days),
+        leave_days: Number(formData.leave_days),
+        absent_days: Number(formData.absent_days)
+      };
+      const daysInMonth = new Date(Number(payload.period.slice(0, 4)), Number(payload.period.slice(5, 7)), 0).getDate();
+      const dayValues = [payload.working_days, payload.leave_days, payload.absent_days];
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(payload.period)
+        || dayValues.some((value) => !Number.isInteger(value) || value < 0)
+        || dayValues.reduce((sum, value) => sum + value, 0) > daysInMonth) {
+        throw new Error(`Jumlah hari harus bilangan bulat nonnegatif dan totalnya tidak boleh melebihi ${daysInMonth} hari.`);
+      }
+      const attendanceId = form.dataset.recordId;
+      if (state.demo) {
+        const employee = state.data.employees.find((item) => item.id === payload.employee_id);
+        if (attendanceId) {
+          const existing = state.data.attendance.find((item) => item.id === attendanceId);
+          if (!existing) throw new Error('Catatan absensi tidak ditemukan.');
+          Object.assign(existing, payload, { employees: employee });
+        } else {
+          const duplicate = state.data.attendance.find((item) => item.employee_id === payload.employee_id && item.period_id === payload.period);
+          if (duplicate) throw new Error('Absensi karyawan ini untuk periode tersebut sudah ada. Edit catatan yang sudah ada.');
+          state.data.attendance.unshift({ ...payload, id: `demo-${crypto.randomUUID()}`, employees: employee, created_at: new Date().toISOString() });
+        }
+        persistDemo();
+      } else if (attendanceId) {
+        await patchJson(`/api/attendance/${encodeURIComponent(attendanceId)}`, payload);
+        await loadData();
+      } else {
+        await postJson('/api/attendance', payload);
+        await loadData();
+      }
+      state.selectedPeriod = payload.period;
+      render();
+      closeModal();
+      showToast(attendanceId ? 'Perubahan absensi berhasil disimpan.' : 'Absensi berhasil disimpan.');
+      return;
+    }
+    if (kind === 'employee') {
+      const employee = { ...formData, monthly_salary: formData.employment_type === 'staff' ? Number(formData.monthly_salary || 0) : 0 };
+      const requiredPrefix = employee.employment_type === 'staff' ? 'STF-' : 'PNN-';
+      if (!String(employee.employee_code).startsWith(requiredPrefix) || String(employee.employee_code).trim().length <= requiredPrefix.length) {
+        throw new Error(`ID karyawan harus menggunakan format ${requiredPrefix} diikuti nomor.`);
+      }
+      const employeeId = form.dataset.recordId;
+      if (employeeId && state.demo) {
+        const existing = state.data.employees.find((item) => item.id === employeeId);
+        if (existing) Object.assign(existing, employee);
+        persistDemo();
+      } else if (employeeId) {
+        await patchJson(`/api/employees/${encodeURIComponent(employeeId)}`, employee);
+        await loadData();
+      } else if (state.demo) {
+        employee.id = `demo-${crypto.randomUUID()}`;
+        state.data.employees.unshift(employee);
+        persistDemo();
+      } else {
+        await postJson('/api/employees', employee);
+        await loadData();      }
+      state.employeeFilter = 'all';
+      render();
+      closeModal();
+      showToast(employeeId ? 'Perubahan karyawan berhasil disimpan.' : 'Data karyawan berhasil disimpan.');
+      return;
+    }
+    const isSalary = kind === 'salary';
+    const selectedHarvestBlock = isSalary ? null : harvestBlockFor(formData.block_code);
+    const harvestFormData = { ...formData };
+    delete harvestFormData.commodity_display;
+    const payload = isSalary
+      ? { ...formData, basic_salary: Number(formData.basic_salary), allowances: Number(formData.allowances || 0), deductions: Number(formData.deductions || 0) }
+      : {
+          ...harvestFormData,
+          block_code: formData.block_code,
+          commodity: selectedHarvestBlock.commodity || null,
+          unit: selectedHarvestBlock.unit || null,
+          weight_kg: Number(formData.weight_kg),
+          rate_per_kg: Number(formData.rate_per_kg),
+          deductions: 0
+        };
+    const grossAmount = isSalary
+      ? payload.basic_salary + payload.allowances
+      : payload.weight_kg * payload.rate_per_kg;
+    if (isSalary && payload.deductions > grossAmount) throw new Error('Potongan tidak boleh melebihi nilai kompensasi kotor.');
+    if (!isSalary && payload.harvest_date.slice(0, 7) !== payload.period) {
+      throw new Error('Tanggal panen harus berada dalam bulan periode yang dipilih.');
+    }
+    const recordId = form.dataset.recordId;
+    if (recordId) {
+      const entries = isSalary ? state.data.salaries : state.data.harvests;
+      const existing = entries.find((entry) => entry.id === recordId);
+      if (!existing) throw new Error('Transaksi tidak ditemukan.');
+      const previousStatus = existing.status;
+      if (state.demo) {
+        let period = state.data.periods.find((item) => item.period === payload.period);
+        if (!period) {
+          period = { id: `period-${payload.period}`, period: payload.period, status: 'open' };
+          state.data.periods.push(period);
+        }
+        const employee = state.data.employees.find((item) => item.id === payload.employee_id);
+        Object.assign(existing, payload, {
+          period_id: period.id, payroll_periods: period, employees: employee,
+          total_amount: isSalary ? payload.basic_salary + payload.allowances - payload.deductions : payload.weight_kg * payload.rate_per_kg
+        });
+        if (payload.status !== previousStatus) existing.paid_at = payload.status === 'paid' ? new Date().toISOString() : null;
+        persistDemo();
+      } else {
+        const changes = { ...payload };
+        if (payload.status === existing.status) delete changes.status;
+        await patchJson(`/api/${isSalary ? 'salaries' : 'harvests'}/${encodeURIComponent(recordId)}`, changes);
+        await loadData();
+      }
+      state.selectedPeriod = payload.period;
+      render();
+      closeModal();
+      showToast('Perubahan transaksi berhasil disimpan.');
+      return;
+    }
+    if (state.demo) {
+      let period = state.data.periods.find((item) => item.period === payload.period);
+      if (!period) {
+        period = { id: `period-${payload.period}`, period: payload.period, status: 'open' };
+        state.data.periods.push(period);
+      }
+      const employee = state.data.employees.find((item) => item.id === payload.employee_id);
+      const entry = { ...payload, id: `demo-${crypto.randomUUID()}`, period_id: period.id, employees: employee, payroll_periods: period, created_at: new Date().toISOString(), paid_at: payload.status === 'paid' ? new Date().toISOString() : null };
+      if (isSalary) {
+        entry.total_amount = payload.basic_salary + payload.allowances - payload.deductions;
+        entry.paid_at = payload.status === 'paid' ? new Date().toISOString() : null;
+        state.data.salaries.unshift(entry);
+      } else {
+        entry.total_amount = payload.weight_kg * payload.rate_per_kg;
+        state.data.harvests.unshift(entry);
+      }
+      assignDemoSlipNumbers(isSalary ? state.data.salaries : state.data.harvests, isSalary ? 'GS' : 'UP', isSalary ? 'payment_date' : 'harvest_date');
+      state.data.auditTrail.push({ transaction_id: entry.id, transaction_kind: isSalary ? 'salary' : 'harvest', action: 'dicatat', actor: 'Admin Arboria', occurred_at: entry.created_at });
+      if (entry.status === 'paid') state.data.auditTrail.push({ transaction_id: entry.id, transaction_kind: isSalary ? 'salary' : 'harvest', action: 'dibayar', actor: 'Admin Arboria', occurred_at: entry.paid_at });
+      state.data.journals = buildDemoJournals(state.data);
+      persistDemo();
+    } else {
+      await postJson(isSalary ? '/api/salaries' : '/api/harvests', payload);
+      await loadData();
+    }
+    state.selectedPeriod = payload.period;
+    render();
+    closeModal();
+    showToast(isSalary ? 'Catatan gaji berhasil disimpan.' : 'Catatan panen dan perhitungan upah berhasil disimpan.');
+  } catch (error) {
+    const message = error.message || 'Transaksi gagal disimpan.';
+    errorNode.textContent = /duplicate key|attendance_records_employee_period_key/i.test(message)
+      ? 'Absensi karyawan ini untuk periode tersebut sudah ada. Edit catatan yang sudah ada.'
+      : message;
+  } finally {
+    submitButton.disabled = false;
+  }
+}
+async function postJson(url, body) {
+  if (backendApiBase() === null) return directSupabaseMutation(url, 'POST', body);
+  const response = await fetch(apiUrl(url), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Permintaan gagal.');
+  return result;
+}
+async function markTransactionPaid(kind, id, button) {
+  const entries = kind === 'salary' ? state.data.salaries : state.data.harvests;
+  const entry = entries.find((item) => item.id === id);
+  if (!entry) return;
+  button.disabled = true;
+  try {
+    if (state.demo) {
+      entry.status = 'paid';
+      entry.paid_at = new Date().toISOString();
+      assignDemoSlipNumbers(kind === 'salary' ? state.data.salaries : state.data.harvests,
+        kind === 'salary' ? 'GS' : 'UP', kind === 'salary' ? 'payment_date' : 'harvest_date');
+      state.data.auditTrail.push({ transaction_id: entry.id, transaction_kind: kind, action: 'dibayar', actor: 'Admin Arboria', slip_number: entry.slip_number, occurred_at: entry.paid_at });
+      for (const correction of state.data.corrections.filter((item) =>
+        item.original_transaction_id === entry.id && item.status === 'pending')) {
+        correction.status = 'paid';
+        correction.paid_at = entry.paid_at;
+        correction.paid_with_original = true;
+        correction.slip_number = null;
+        state.data.auditTrail.filter((item) => item.transaction_id === correction.id)
+          .forEach((item) => { item.slip_number = entry.slip_number; });
+        state.data.auditTrail.push({ transaction_id: correction.id, transaction_kind: kind, action: 'dibayar', actor: 'Admin Arboria', slip_number: entry.slip_number, occurred_at: entry.paid_at });
+      }
+      state.data.journals = buildDemoJournals(state.data);
+      persistDemo();
+    } else {
+      await patchJson(`/api/${kind === 'salary' ? 'salaries' : 'harvests'}/${encodeURIComponent(id)}`, { status: 'paid' });
+      await loadData();
+    }
+    render();
+    showToast('Status transaksi berhasil diubah menjadi dibayar.');
+  } catch (error) {
+    button.disabled = false;
+    showToast(error.message || 'Status transaksi gagal diperbarui.');
+  }
+}
+async function markCorrectionPaid(id, button) {
+  const correction = state.data.corrections.find((item) => item.id === id);
+  if (!correction || correction.status !== 'pending' || Number(correction.net_amount) <= 0) return;
+  const source = [...state.data.salaries, ...state.data.harvests].find((item) => item.id === correction.original_transaction_id);
+  if (!source || source.status !== 'paid') return;
+  button.disabled = true;
+  try {
+    if (state.demo) {
+      correction.status = 'paid';
+      correction.paid_at = new Date().toISOString();
+      correction.paid_with_original = false;
+      assignDemoSlipNumbers([
+        ...(correction.transaction_kind === 'salary' ? state.data.salaries : state.data.harvests),
+        ...state.data.corrections.filter((item) => item.transaction_kind === correction.transaction_kind)
+      ], correction.transaction_kind === 'salary' ? 'GS' : 'UP',
+      correction.transaction_kind === 'salary' ? 'payment_date' : 'harvest_date');
+      state.data.auditTrail.push({
+        transaction_id: correction.id, transaction_kind: correction.transaction_kind,
+        action: 'dibayar', actor: 'Admin Arboria', slip_number: correction.slip_number,
+        occurred_at: correction.paid_at
+      });
+      state.data.journals = buildDemoJournals(state.data);
+      persistDemo();
+    } else if (backendApiBase() === null) {
+      await supabaseRequest('rpc/payroll_correction_payment', '', 'POST', { correction_key: id });
+      await loadData();
+    } else {
+      await postJson(`/api/corrections/${encodeURIComponent(id)}/pay`, {});
+      await loadData();
+    }
+    render();
+    showToast('Pembayaran koreksi berhasil dicatat.');
+  } catch (error) {
+    button.disabled = false;
+    showToast(error.message || 'Pembayaran koreksi gagal dicatat.');
+  }
+}
+async function saveDailyAttendance() {
+  const date = document.querySelector('#attendance-date').value;
+  const type = document.querySelector('#attendance-type-filter').value;
+  const search = document.querySelector('#attendance-search').value.trim().toLowerCase();
+  const employees = state.data.employees.filter((employee) => !employee.archived_at
+    && (type === 'all' || employee.employment_type === type)
+    && `${employee.full_name} ${employee.employee_code}`.toLowerCase().includes(search));
+  if (!date) return showToast('Tanggal absensi wajib dipilih.');
+  const records = employees.map((employee) => ({
+    employee_id: employee.id,
+    status: state.dailyStatuses[employee.id] || state.data.dailyAttendance.find((item) => item.employee_id === employee.id && item.attendance_date === date)?.status || ''
+  }));
+  if (!records.length) return showToast('Tidak ada karyawan pada filter yang dipilih.');
+  if (records.some((record) => !record.status)) return showToast('Pilih status absensi untuk setiap karyawan yang ditampilkan.');
+  try {
+    if (state.demo) {
+      for (const record of records) {
+        const existing = state.data.dailyAttendance.find((item) => item.employee_id === record.employee_id && item.attendance_date === date);
+        const employee = state.data.employees.find((item) => item.id === record.employee_id);
+        if (existing) existing.status = record.status;
+        else state.data.dailyAttendance.push({ ...record, attendance_date: date, id: `daily-${crypto.randomUUID()}`, recorded_by: 'Admin Arboria', employees: employee });
+      }
+      persistDemo();
+    } else if (backendApiBase() === null) {
+      await supabaseRequest('daily_attendance?on_conflict=employee_id,attendance_date', '', 'POST',
+        records.map((record) => ({ ...record, attendance_date: date, recorded_by: 'Admin Arboria' })),
+        'resolution=merge-duplicates,return=representation');
+      await loadData();
+    } else {
+      const response = await fetch(apiUrl('/api/attendance/daily'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attendance_date: date, records })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Absensi gagal disimpan.');
+      await loadData();
+    }
+    state.dailyStatuses = {};
+    render();
+    showToast('Absensi harian berhasil disimpan.');
+  } catch (error) {
+    showToast(error.message || 'Absensi harian gagal disimpan.');
+  }
+}
+function printJournalReport() {
+  const journals = matchingJournals(state.journalPeriod, state.journalType);
+  const rows = journalBlocks(journals).map((block) => {
+    const entries = journalBlockLines(block);
+    return entries.map(({ journal, journalIndex, lineIndex, line }, index) => {
+      const account = line.accounts || getAccount(line.account_code);
+      const credit = Number(line.credit || 0) > 0;
+      const startsSubjournal = block.isReversalGroup && journalIndex > 0 && lineIndex === 0;
+      const rowClasses = [startsSubjournal ? 'journal-group-separator' : ''].filter(Boolean).join(' ');
+      const header = index === 0
+        ? `<td rowspan="${entries.length}">${escapeHtml(formatDate(journalDate(block.journals[0])))}</td><td rowspan="${entries.length}">${escapeHtml(journalEvidence(block.journals[0]))}</td><td rowspan="${entries.length}">${escapeHtml(journalTypeLabel(block.journals[0].journal_type))}</td><td rowspan="${entries.length}">${escapeHtml(journalBlockDescription(block))}</td>`
+        : '';
+      return `<tr class="${rowClasses}">${header}<td class="${credit ? 'journal-credit-account' : ''}">${escapeHtml(account.code)} · ${escapeHtml(account.name)}</td><td>${Number(line.debit) ? formatMoney(line.debit) : '—'}</td><td>${Number(line.credit) ? formatMoney(line.credit) : '—'}</td></tr>`;
+    }).join('');
+  }).join('');
+  const totals = journalTotals(journals);
+  printReport('Jurnal Umum', selectionLabel(state.journalPeriod), ['Tanggal', 'No. Slip', 'Jenis', 'Keterangan', 'Akun', 'Debit', 'Kredit'], rows,
+    `Total debit: ${formatMoney(totals.debit)} · Total kredit: ${formatMoney(totals.credit)}`);
+}
+function printLedgerReport() {
+  const { start, end } = periodDateRange(state.ledgerPeriod);
+  const accounts = state.data.accounts.filter((account) => state.ledgerAccount === 'all' || account.code === state.ledgerAccount);
+  const rows = accounts.flatMap((account) => {
+    let balance = accountMovements(account, new Date(new Date(`${start}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10)).balance;
+    return ledgerEntriesForAccount(account, start, end)
+      .map(({ journal, line }) => {
+        balance += movementFor(line, account);
+        return `<tr><td>${escapeHtml(formatDate(journalDate(journal)))}</td><td>${escapeHtml(journalEvidence(journal))}</td><td>${escapeHtml(journalTypeLabel(journal.journal_type))}</td><td>${escapeHtml(journal.description)}</td><td>${Number(line.debit) ? formatMoney(line.debit) : '—'}</td><td>${Number(line.credit) ? formatMoney(line.credit) : '—'}</td><td>${formatMoney(balance)}</td></tr>`;
+      });
+  }).join('');
+  const totals = state.data.accounts.reduce((accumulator, account) => {
+    const balance = account.normal_balance === 'debit' ? accountMovements(account).balance : -accountMovements(account).balance;
+    accumulator.debit += Math.max(0, balance);
+    accumulator.credit += Math.max(0, -balance);
+    return accumulator;
+  }, { debit: 0, credit: 0 });
+  printReport('Buku Besar', selectionLabel(state.ledgerPeriod), ['Tanggal', 'No. Slip', 'Jenis', 'Keterangan', 'Debit', 'Kredit', 'Saldo'], rows,
+    `Neraca saldo — Debit: ${formatMoney(totals.debit)} · Kredit: ${formatMoney(totals.credit)}`);
+}
+function printAttendanceReport() {
+  const period = state.attendancePeriod;
+  const type = document.querySelector('#attendance-report-type').value;
+  const search = document.querySelector('#attendance-report-search').value.trim().toLowerCase();
+  const byEmployee = new Map();
+  for (const entry of attendancePeriodRecords(period)) {
+    const summary = byEmployee.get(entry.employee_id) || { present: 0, leave: 0, absent: 0 };
+    summary[entry.status] += 1;
+    byEmployee.set(entry.employee_id, summary);
+  }
+  const legacyRows = state.data.attendance.filter((entry) => reportPeriodMatches(entry.period_id, period)
+    && !state.data.dailyAttendance.some((daily) => daily.employee_id === entry.employee_id && daily.attendance_date.slice(0, 7) === entry.period_id));
+  for (const entry of legacyRows) {
+    const record = byEmployee.get(entry.employee_id) || { present: 0, leave: 0, absent: 0 };
+    record.present += Number(entry.working_days || 0);
+    record.leave += Number(entry.leave_days || 0);
+    record.absent += Number(entry.absent_days || 0);
+    byEmployee.set(entry.employee_id, record);
+  }
+  const rows = state.data.employees.filter((employee) =>
+    (type === 'all' || employee.employment_type === type)
+    && `${employee.full_name} ${employee.employee_code}`.toLowerCase().includes(search)).map((employee) => {
+      const record = byEmployee.get(employee.id) || { present: 0, leave: 0, absent: 0 };
+      return `<tr><td>${escapeHtml(employee.full_name)}</td><td>${escapeHtml(employee.employee_code)}</td><td>${employee.employment_type === 'staff' ? 'Staf' : 'Pemanen'}</td><td>${record.present}</td><td>${record.leave}</td><td>${record.absent}</td></tr>`;
+    }).join('');
+  printReport('Rekap Absensi', selectionLabel(period), ['Nama', 'ID', 'Jenis tenaga kerja', 'Hadir', 'Izin', 'Alfa'], rows);
+}
+async function patchJson(url, body) {
+  if (backendApiBase() === null) return directSupabaseMutation(url, 'PATCH', body);
+  const response = await fetch(apiUrl(url), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Permintaan gagal.');
+  return result;
+}
+async function deleteJson(url) {
+  if (backendApiBase() === null) return directSupabaseMutation(url, 'DELETE');
+  const response = await fetch(apiUrl(url), { method: 'DELETE' });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Permintaan gagal.');
+  return result;
+}
+async function deleteEmployee(id) {
+  const employee = state.data.employees.find((item) => item.id === id);
+  if (!employee || employee.archived_at
+    || !window.confirm(`Hapus karyawan ${employee.full_name}? Riwayat gaji, upah panen, koreksi, dan absensi tetap tersimpan dan dapat dilihat kembali.`)) return;
+  try {
+    if (state.demo) {
+      employee.archived_at = new Date().toISOString();
+      persistDemo();
+    } else {
+      await patchJson(`/api/employees/${encodeURIComponent(id)}`, { archived_at: new Date().toISOString() });
+      await loadData();
+    }
+    render();
+    showToast('Karyawan dihapus. Semua riwayat tetap tersimpan.');
+  } catch (error) {
+    showToast(error.message || 'Karyawan gagal dihapus.');
+  }
+}
+async function restoreEmployee(id) {
+  const employee = state.data.employees.find((item) => item.id === id);
+  if (!employee || !employee.archived_at
+    || !window.confirm(`Pulihkan karyawan ${employee.full_name} agar tersedia kembali untuk input baru?`)) return;
+  try {
+    if (state.demo) {
+      employee.archived_at = null;
+      persistDemo();
+    } else {
+      await patchJson(`/api/employees/${encodeURIComponent(id)}`, { archived_at: null });
+      await loadData();
+    }
+    render();
+    showToast('Karyawan berhasil dipulihkan.');
+  } catch (error) {
+    showToast(error.message || 'Karyawan gagal dipulihkan.');
+  }
+}
+async function deleteAttendance(id) {
+  const entry = state.data.attendance.find((item) => item.id === id);
+  if (!entry || !window.confirm(`Hapus absensi ${employeeFor(entry).full_name} periode ${monthLabel(entry.period_id)}?`)) return;
+  try {
+    if (state.demo) {
+      state.data.attendance = state.data.attendance.filter((item) => item.id !== id);
+      persistDemo();
+    } else {
+      await deleteJson(`/api/attendance/${encodeURIComponent(id)}`);
+      await loadData();
+    }
+    render();
+    showToast('Catatan absensi berhasil dihapus.');
+  } catch (error) {
+    showToast(error.message || 'Catatan absensi gagal dihapus.');
+  }
+}
+document.addEventListener('click', (event) => {
+  const notificationPopover = document.querySelector('#notification-popover');
+  const notificationButton = event.target.closest('.notification-button');
+  if (!event.target.closest('.notification-wrap')) {
+    notificationPopover.hidden = true;
+    document.querySelector('.notification-button').setAttribute('aria-expanded', 'false');
+  }
+  if (notificationButton) {
+    notificationPopover.hidden = !notificationPopover.hidden;
+    notificationButton.setAttribute('aria-expanded', String(!notificationPopover.hidden));
+    return;
+  }
+  const attendanceTab = event.target.closest('[data-attendance-tab]');
+  if (attendanceTab) {
+    state.attendanceTab = attendanceTab.dataset.attendanceTab;
+    document.querySelectorAll('[data-attendance-tab]').forEach((tab) => tab.classList.toggle('active', tab === attendanceTab));
+    document.querySelector('#attendance-daily-panel').hidden = state.attendanceTab !== 'daily';
+    document.querySelector('#attendance-summary-panel').hidden = state.attendanceTab !== 'summary';
+    return;
+  }
+  const attendanceDetail = event.target.closest('[data-attendance-detail]');
+  if (attendanceDetail) {
+    const employee = state.data.employees.find((item) => item.id === attendanceDetail.dataset.attendanceDetail);
+    if (employee) openModal('attendance-detail', { employee, period: state.attendancePeriod });
+    return;
+  }
+  const journalDetail = event.target.closest('[data-journal-detail]');
+  if (journalDetail) {
+    const journal = state.data.journals.find((item) => item.id === journalDetail.dataset.journalDetail);
+    if (journal) openModal('journal-detail', journal);
+    return;
+  }
+  const transactionDetail = event.target.closest('[data-transaction-detail]');
+  if (transactionDetail) {
+    const entry = transactions().find((item) => item.id === transactionDetail.dataset.transactionDetail);
+    if (entry) openModal('transaction-detail', entry);
+    return;
+  }
+  const cancelTransaction = event.target.closest('[data-cancel-record]');
+  if (cancelTransaction) {
+    const entry = transactions().find((item) => item.id === cancelTransaction.dataset.cancelRecord);
+    if (entry && !entry.is_correction && entry.status !== 'cancelled') openModal('cancel', entry);
+    return;
+  }
+  const correctTransaction = event.target.closest('[data-correct-record]');
+  if (correctTransaction) {
+    const entry = transactions().find((item) => item.id === correctTransaction.dataset.correctRecord);
+    if (entry && !entry.is_correction && entry.status !== 'cancelled') openModal('correction', entry);
+    return;
+  }
+  const cancelFromDetail = event.target.closest('[data-cancel-detail]');
+  if (cancelFromDetail) {
+    const entry = transactions().find((item) => item.id === cancelFromDetail.dataset.cancelDetail);
+    if (entry && !entry.is_correction && entry.status !== 'cancelled') {
+      closeModal();
+      openModal('cancel', entry);
+    }
+    return;
+  }
+  const correctFromDetail = event.target.closest('[data-correct-detail]');
+  if (correctFromDetail) {
+    const entry = transactions().find((item) => item.id === correctFromDetail.dataset.correctDetail);
+    if (entry && !entry.is_correction && entry.status !== 'cancelled') {
+      closeModal();
+      openModal('correction', entry);
+    }
+    return;
+  }
+  const editAttendanceButton = event.target.closest('[data-edit-attendance]');
+  if (editAttendanceButton) {
+    const entry = state.data.attendance.find((item) => item.id === editAttendanceButton.dataset.editAttendance);
+    if (entry) openModal('attendance', entry);
+    return;
+  }
+  const deleteAttendanceButton = event.target.closest('[data-delete-attendance]');
+  if (deleteAttendanceButton) {
+    deleteAttendance(deleteAttendanceButton.dataset.deleteAttendance);
+    return;
+  }
+  const printSlipButton = event.target.closest('[data-print-slip]');
+  if (printSlipButton) {
+    const entry = transactions().find((item) => item.id === printSlipButton.dataset.printSlip);
+    if (entry && entry.status !== 'pending' && entry.slip_number) openPaymentSlipPreview(entry);
+    return;
+  }
+  const editEmployeeButton = event.target.closest('[data-edit-employee]');
+  if (editEmployeeButton) {
+    const employee = state.data.employees.find((item) => item.id === editEmployeeButton.dataset.editEmployee);
+    if (employee) openModal('employee', employee);
+    return;
+  }
+  const deleteEmployeeButton = event.target.closest('[data-delete-employee]');
+  if (deleteEmployeeButton) {
+    deleteEmployee(deleteEmployeeButton.dataset.deleteEmployee);
+    return;
+  }
+  const restoreEmployeeButton = event.target.closest('[data-restore-employee]');
+  if (restoreEmployeeButton) {
+    restoreEmployee(restoreEmployeeButton.dataset.restoreEmployee);
+    return;
+  }
+  const statusButton = event.target.closest('[data-mark-paid]');
+  if (statusButton) {
+    markTransactionPaid(statusButton.dataset.markPaid, statusButton.dataset.entryId, statusButton);
+    return;
+  }
+  const correctionStatusButton = event.target.closest('[data-mark-correction-paid]');
+  if (correctionStatusButton) {
+    markCorrectionPaid(correctionStatusButton.dataset.markCorrectionPaid, correctionStatusButton);
+    return;
+  }
+  const viewButton = event.target.closest('[data-view]');
+  if (viewButton) { switchView(viewButton.dataset.view); return; }
+  const actionButton = event.target.closest('[data-action]');
+  if (actionButton) {
+    const action = actionButton.dataset.action;
+    if (action === 'close-slip-preview') closePaymentSlipPreview();
+    if (action === 'download-slip') downloadPaymentSlip(state.previewSlip, actionButton);
+    if (action === 'add-employee') openModal('employee');
+    if (action === 'record-salary') openModal('salary');
+    if (action === 'record-harvest') openModal('harvest');
+    if (action === 'add-attendance') {
+      switchView('attendance');
+      state.attendanceTab = 'daily';
+      document.querySelector('#attendance-daily-panel').hidden = false;
+      document.querySelector('#attendance-summary-panel').hidden = true;
+      document.querySelectorAll('[data-attendance-tab]').forEach((tab) => tab.classList.toggle('active', tab.dataset.attendanceTab === 'daily'));
+    }
+    if (action === 'attendance-all-present') {
+      const type = document.querySelector('#attendance-type-filter').value;
+      const search = document.querySelector('#attendance-search').value.trim().toLowerCase();
+      state.data.employees.filter((employee) => !employee.archived_at && (type === 'all' || employee.employment_type === type)
+        && `${employee.full_name} ${employee.employee_code}`.toLowerCase().includes(search))
+        .forEach((employee) => { state.dailyStatuses[employee.id] = 'present'; });
+      renderAttendance();
+    }
+    if (action === 'save-daily-attendance') saveDailyAttendance();
+    if (action === 'print-journal') printJournalReport();
+    if (action === 'print-ledger') printLedgerReport();
+    if (action === 'print-attendance') printAttendanceReport();
+    if (action === 'close-modal') closeModal();
+    return;
+  }
+  const employeeFilter = event.target.closest('[data-filter]');
+  if (employeeFilter) {
+    state.employeeFilter = employeeFilter.dataset.filter;
+    document.querySelectorAll('.filter-tab').forEach((tab) => tab.classList.toggle('active', tab === employeeFilter));
+    renderEmployees();
+  }
+  const payrollFilter = event.target.closest('[data-payroll-filter]');
+  if (payrollFilter) {
+    state.payrollFilter = payrollFilter.dataset.payrollFilter;
+    document.querySelectorAll('.payroll-filter').forEach((tab) => tab.classList.toggle('active', tab === payrollFilter));
+    renderPayroll();
+  }
+});
+function setReportPeriod(period) {
+  state.selectedPeriod = period;
+  render();
+}
+document.querySelector('#period-select').addEventListener('change', (event) => setReportPeriod(event.target.value));
+document.querySelector('#sidebar-period-select').addEventListener('change', (event) => {
+  document.querySelector('#sidebar-period-label').textContent = event.target.selectedOptions[0]?.textContent || '';
+  setReportPeriod(event.target.value);
+});
+document.querySelector('#payroll-period-filter').addEventListener('change', (event) => setReportPeriod(event.target.value));
+document.querySelector('#attendance-period-filter').addEventListener('change', (event) => { state.attendancePeriod = event.target.value; renderAttendance(); });
+document.querySelector('#journal-period-filter').addEventListener('change', (event) => { state.journalPeriod = event.target.value; renderJournal(); });
+document.querySelector('#journal-type-filter').addEventListener('change', (event) => { state.journalType = event.target.value; renderJournal(); });
+document.querySelector('#ledger-period-filter').addEventListener('change', (event) => { state.ledgerPeriod = event.target.value; renderLedger(); });
+document.querySelector('#ledger-account-filter').addEventListener('change', (event) => { state.ledgerAccount = event.target.value; renderLedger(); });
+document.querySelector('#employee-search').addEventListener('input', (event) => { state.search = event.target.value; renderEmployees(); });
+document.querySelector('#attendance-date').addEventListener('change', () => { state.dailyStatuses = {}; renderAttendance(); });
+document.querySelector('#attendance-type-filter').addEventListener('change', renderAttendance);
+document.querySelector('#attendance-report-type').addEventListener('change', renderAttendance);
+document.querySelector('#attendance-search').addEventListener('input', renderAttendance);
+document.querySelector('#attendance-report-search').addEventListener('input', renderAttendance);
+document.addEventListener('change', (event) => {
+  const input = event.target.closest('[data-attendance-status]');
+  if (input) {
+    state.dailyStatuses[input.dataset.attendanceStatus] = input.value;
+    renderAttendance();
+  }
+});
+document.querySelector('#modal-form').addEventListener('submit', submitForm);
+document.querySelector('#modal-backdrop').addEventListener('click', (event) => { if (event.target.id === 'modal-backdrop') closeModal(); });
+document.querySelector('#slip-preview-backdrop').addEventListener('click', (event) => { if (event.target.id === 'slip-preview-backdrop') closePaymentSlipPreview(); });
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  if (!document.querySelector('#slip-preview-backdrop').hidden) closePaymentSlipPreview();
+  else if (!document.querySelector('#modal-backdrop').hidden) closeModal();
+});
+loadData();
