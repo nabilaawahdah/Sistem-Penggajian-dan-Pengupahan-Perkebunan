@@ -252,3 +252,4 @@ Konfigurasi ini hanya sesuai untuk demonstrasi atau data latihan. Sebelum menggu
 - Karena status absensi hanya menyediakan Hadir, Izin, dan Alfa, kartu “Total izin” menampilkan jumlah status Izin; belum ada kategori Sakit tersendiri.
 - Uji alur: catat gaji dengan status menunggu pembayaran; pastikan nomor slip belum terbit; koreksi beberapa kali lalu tandai dibayar dan pastikan satu slip memakai nilai akhir. Koreksi positif setelah dibayar harus memperoleh slip saat pembayaran tambahan dilakukan; koreksi negatif harus ditandai sebagai kelebihan bayar tanpa slip baru. Batalkan transaksi dan pastikan ada satu jurnal pembalik seimbang per jurnal asal, urutan pengakuan-pembayaran-koreksi benar, serta slip yang pernah terbit ber-watermark DIBATALKAN.
 
+
